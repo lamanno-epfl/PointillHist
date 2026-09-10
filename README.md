@@ -33,8 +33,8 @@ The method is described in
 
 ## Installation
 
-PointillHist is a pure-Python package for Python 3.10 or later, built on `torch` and
-`torch_geometric` (no compiled extension needed). Install it in one of three ways, spelled out
+PointillHist is a Python package for Python 3.10 or later, built on `torch` and
+`torch_geometric`. Install it in one of three ways, spelled out
 in the **[installation guide](guide/installation.md)**:
 
 - **pip**, into an existing environment: `pip install "pointillhist @ git+https://github.com/lamanno-epfl/PointillHist.git"`
