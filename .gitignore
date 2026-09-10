@@ -1,0 +1,16 @@
+# not part of the public repository
+__pycache__/
+*.py[cod]
+tests/
+CLEANUP_PLAN.md
+
+# environments and build artefacts
+.venv/
+*.egg-info/
+dist/
+build/
+
+# outputs of the examples
+results/
+checkpoints/
+.ipynb_checkpoints/
