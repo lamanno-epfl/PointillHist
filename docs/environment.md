@@ -68,7 +68,8 @@ pip install torch --index-url https://download.pytorch.org/whl/cu126    # a spec
 uv pip install torch --torch-backend=auto                               # uv: pick from the installed driver
 ```
 
-With uv, from the root of a clone (`git clone` and `cd PointillHist` as in the README), there
+With uv, from the root of a clone (`git clone` and `cd PointillHist` as in the
+[installation guide](../guide/installation.md)), there
 are two ways to get a different `torch` than the locked CUDA 13 build. Either skip the lock and
 install into a plain virtual environment (`--torch-backend=auto` picks the CUDA build matching
 the installed driver, `cpu` the CPU build):

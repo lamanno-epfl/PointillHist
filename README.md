@@ -33,53 +33,17 @@ The method is described in
 
 ## Installation
 
-PointillHist is a pure-Python package for Python 3.10 or later. Its dependencies are
-`torch`, `torch_geometric`, `anndata`, `numpy`, `scipy`, `pandas`, `tqdm`, `matplotlib`,
-`seaborn` and `scikit-learn`; the compiled extensions of PyTorch Geometric (`pyg_lib`,
-`torch_scatter`, ...) are not needed. Two extras exist: `umap` for the optional embedding of
-the predictions (`ph.eval.umap`) and `examples` for the optional dependencies of the example
-scripts (`openpyxl` for the ABCA-2 taxonomy sheet, `pyarrow` for the parquet output of
-`minimal.py`).
+PointillHist is a pure-Python package for Python 3.10 or later, built on `torch` and
+`torch_geometric` (no compiled extension needed). Install it in one of three ways, spelled out
+in the **[installation guide](guide/installation.md)**:
 
-**pip**, into an existing environment that has `git` on its PATH (on Linux the `torch` wheel
-from PyPI includes CUDA; see the note on NVIDIA drivers below):
+- **pip**, into an existing environment: `pip install "pointillhist @ git+https://github.com/lamanno-epfl/PointillHist.git"`
+- **uv**, from a clone, with the versions pinned in `uv.lock`: `uv sync --all-extras`
+- **conda**, letting conda provide Python and pip install the package as above.
 
-```bash
-pip install "pointillhist[umap,examples] @ git+https://github.com/lamanno-epfl/PointillHist.git"
-```
-
-**uv**, from a clone, with the versions pinned in [`uv.lock`](uv.lock), resolved separately
-for Python 3.10, 3.11 and 3.12 or newer; we run the demo and our internal tests on all three:
-
-```bash
-git clone https://github.com/lamanno-epfl/PointillHist.git
-cd PointillHist
-uv sync --all-extras                          # creates .venv with the locked versions
-uv run python examples/minimal.py --demo      # or: source .venv/bin/activate
-```
-
-**conda**, letting conda provide Python and pip the packages (PointillHist itself is not on
-conda, and the PyPI builds of `torch` and `torch_geometric` are the ones we test):
-
-```bash
-conda create -n pointillhist python=3.11 git      # git: pip installs from the git URL below
-conda activate pointillhist
-pip install "pointillhist[umap,examples] @ git+https://github.com/lamanno-epfl/PointillHist.git"
-```
-
-The `torch` that PyPI serves by default is a CUDA 13 build (2.14.0+cu130 in September 2026)
-and needs an NVIDIA driver of version 580 or newer (`nvidia-smi` prints it); with an older
-driver the installation succeeds but `torch.cuda.is_available()` is `False`. In that case, on
-a CPU-only machine, or for a specific CUDA version, install `torch` first following
-[pytorch.org](https://pytorch.org/get-started/locally/), for example
-`pip install torch --index-url https://download.pytorch.org/whl/cu126`, and then PointillHist
-with pip as above. The uv equivalent is in [`docs/environment.md`](docs/environment.md), which
-also lists the supported version ranges, the platforms we test on and the versions the
-manuscript results were produced with.
-
-To check the installation, `python -c "import pointillhist as ph; print(ph.__version__)"`
-must print the version, and `python examples/minimal.py --demo` (from a clone) runs the
-whole pipeline on a small synthetic dataset in well under a minute, GPU or not.
+The guide also covers the optional extras (`umap`, `examples`), CPU-only and specific CUDA
+builds of `torch`, and how to check the installation with `python examples/minimal.py --demo`.
+[`docs/environment.md`](docs/environment.md) lists the supported and tested versions.
 
 ## Quick start
 
