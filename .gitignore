@@ -5,7 +5,7 @@ tests/
 CLEANUP_PLAN.md
 
 # environments and build artefacts
-.venv/
+.venv*/
 *.egg-info/
 dist/
 build/

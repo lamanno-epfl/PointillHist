@@ -4,19 +4,18 @@ Zhuang ABCA-2 (MERFISH, 66 coronal sections) mapped to the ~1200 Yao 2023 supert
 import glob
 import os
 import pickle
-import sys
 
 import numpy as np
 import pandas as pd
 import torch
 
-REPO = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))   # repository root
-sys.path.insert(0, REPO)
 import pointillhist as ph
 
-DATA_DIR = os.path.join(REPO, "notebooks_Merfish", "ABCA2")
-REFERENCE = os.path.join(REPO, "zhuang", "PH_Yao2023_avg", "reference_matrix_Yao2023_supertype.csv")
-OUT = os.path.join(REPO, "notebooks_Merfish", "ABCA2_supertype", "pointillhist")
+# Where the downloaded data live and where the outputs go; edit the three paths to your layout.
+DATA_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))   # the directory holding the clone
+DATA_DIR = os.path.join(DATA_ROOT, "notebooks_Merfish", "ABCA2")
+REFERENCE = os.path.join(DATA_ROOT, "zhuang", "PH_Yao2023_avg", "reference_matrix_Yao2023_supertype.csv")
+OUT = os.path.join(DATA_ROOT, "notebooks_Merfish", "ABCA2_supertype", "pointillhist")
 os.makedirs(OUT, exist_ok=True)
 
 # reference: ~1200 supertypes x 1122 panel genes
@@ -54,7 +53,7 @@ predictions = pd.DataFrame({
 })
 
 # aggregate the supetypes back to subclass and class using the Yao et al. 2023 taxonomy (supertype -> subclass -> class)
-HIERARCHY = os.path.join(REPO, "zhuang", "celltypes_info.xlsx")      # Yao 2023 taxonomy: supertype -> subclass -> class
+HIERARCHY = os.path.join(DATA_ROOT, "zhuang", "celltypes_info.xlsx")      # Yao 2023 taxonomy: supertype -> subclass -> class
 hierarchy = pd.read_excel(HIERARCHY, sheet_name="supertype_annotation").set_index("supertype_label")
 predictions["subclass_label"] = predictions["supertype_label"].map(hierarchy["subclass_label"]).values
 predictions["class_label"] = predictions["supertype_label"].map(hierarchy["class_label"]).values

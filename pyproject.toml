@@ -1,0 +1,58 @@
+[build-system]
+requires = ["hatchling>=1.25"]
+build-backend = "hatchling.build"
+
+[project]
+name = "pointillhist"
+dynamic = ["version"]
+description = "Context-aware cell identity assignment for spatial transcriptomics"
+readme = "README.md"
+requires-python = ">=3.10"
+authors = [
+    { name = "Alireza Gargoori Motlagh" }
+]
+keywords = ["spatial transcriptomics", "cell typing", "cell type mapping", "graph neural network", "single-cell"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Science/Research",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Scientific/Engineering :: Bio-Informatics",
+]
+# Lower bounds are the versions the manuscript results were produced with
+# (docs/environment.md); the package is also tested on the current releases.
+# PyTorch Geometric's compiled extensions (pyg_lib, torch_scatter, torch_sparse,
+# torch_cluster) are optional accelerators and deliberately not required.
+dependencies = [
+    "torch>=2.4",
+    "torch-geometric>=2.6",
+    "anndata>=0.10.9",
+    "numpy>=1.26",
+    "scipy>=1.14",
+    "pandas>=2.2,<3",
+    "tqdm>=4.66",
+    "matplotlib>=3.9",
+    "seaborn>=0.13",
+    "scikit-learn>=1.5",
+]
+
+[project.optional-dependencies]
+# ph.eval.umap
+umap = ["umap-learn>=0.5"]
+# examples/train_abca2_supertype.py reads the taxonomy from an Excel sheet;
+# examples/minimal.py writes the predictions as parquet when pyarrow is present.
+examples = ["openpyxl>=3.1", "pyarrow>=17"]
+
+[project.urls]
+Homepage = "https://github.com/lamanno-epfl/PointillHist"
+Repository = "https://github.com/lamanno-epfl/PointillHist"
+Issues = "https://github.com/lamanno-epfl/PointillHist/issues"
+
+[tool.hatch.version]
+path = "src/pointillhist/__init__.py"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/pointillhist"]

@@ -10,8 +10,8 @@
 <p align="center">
   <a href="PAPER_URL_PLACEHOLDER"><img src="https://img.shields.io/badge/paper-bioRxiv%202026-b31b1b.svg" alt="paper"></a>
   <img src="https://img.shields.io/badge/python-3.10%2B-3776ab.svg" alt="python">
-  <img src="https://img.shields.io/badge/PyTorch-2.4-ee4c2c.svg" alt="pytorch">
-  <img src="https://img.shields.io/badge/PyTorch%20Geometric-2.6-3c2179.svg" alt="pyg">
+  <img src="https://img.shields.io/badge/PyTorch-%E2%89%A5%202.4-ee4c2c.svg" alt="pytorch">
+  <img src="https://img.shields.io/badge/PyTorch%20Geometric-%E2%89%A5%202.6-3c2179.svg" alt="pyg">
 </p>
 
 ---
@@ -31,22 +31,44 @@ The method is described in
 
 ## Installation
 
-PointillHist is a plain Python package with no build step. Clone the repository and import
-it from the directory that contains the clone, or add that directory to `PYTHONPATH`.
+PointillHist is a pure-Python package for Python 3.10 or later. Its dependencies are
+`torch`, `torch_geometric`, `anndata`, `numpy`, `scipy`, `pandas`, `tqdm`, `matplotlib`,
+`seaborn` and `scikit-learn`; the compiled extensions of PyTorch Geometric (`pyg_lib`,
+`torch_scatter`, ...) are not needed. Two extras exist: `umap` for the optional embedding of
+the predictions (`ph.eval.umap`) and `examples` for the two dataset examples.
+
+**pip**, into an existing environment (on Linux the `torch` wheel from PyPI includes CUDA):
 
 ```bash
-git clone REPO_URL_PLACEHOLDER pointillhist
-python -c "import pointillhist as ph; print('ok')"      # run from the directory holding the clone
+pip install "pointillhist[umap,examples] @ git+https://github.com/lamanno-epfl/PointillHist.git"
 ```
 
-It needs Python 3.10 or later with `torch` (CUDA build recommended), `torch_geometric`,
-`anndata`, `numpy`, `scipy`, `pandas`, `tqdm`, `matplotlib`, `seaborn` and `scikit-learn`
-(`umap-learn` only for the optional embedding of the predictions, `openpyxl` only for the
-atlas example, which reads its taxonomy from an Excel sheet). The versions we run with
-are listed in [`docs/environment.md`](docs/environment.md).
+**uv**, from a clone, with the exact versions we test with taken from [`uv.lock`](uv.lock):
 
-To check the installation, `python pointillhist/examples/minimal.py --demo` runs the whole
-pipeline on a small synthetic dataset in well under a minute, GPU or not.
+```bash
+git clone https://github.com/lamanno-epfl/PointillHist.git
+cd PointillHist
+uv sync --all-extras                          # creates .venv with the locked versions
+uv run python examples/minimal.py --demo      # or: source .venv/bin/activate
+```
+
+**conda**, letting conda provide Python and pip the packages, because PyTorch Geometric has
+no conda packages for recent PyTorch versions:
+
+```bash
+conda create -n pointillhist python=3.11
+conda activate pointillhist
+pip install "pointillhist[umap,examples] @ git+https://github.com/lamanno-epfl/PointillHist.git"
+```
+
+For a CPU-only machine or a specific CUDA version, install `torch` first following
+[pytorch.org](https://pytorch.org/get-started/locally/) and then PointillHist as above.
+[`docs/environment.md`](docs/environment.md) lists the supported version ranges and the
+versions the manuscript results were produced with.
+
+To check the installation, `python -c "import pointillhist as ph; print(ph.__version__)"`
+must print the version, and `python examples/minimal.py --demo` (from a clone) runs the
+whole pipeline on a small synthetic dataset in well under a minute, GPU or not.
 
 ## Quick start
 
@@ -100,7 +122,7 @@ everything is a NumPy array, ready for `pandas` or `pickle`.
 
 | example | what it shows |
 |---|---|
-| [`examples/minimal.py`](examples/minimal.py) | The four calls above with the predictions and the loss curves written to a `results/` folder. `python examples/minimal.py --demo` runs it on a small synthetic dataset generated on the fly by [`tests/_dataset.py`](tests/_dataset.py), so nothing needs downloading. |
+| [`examples/minimal.py`](examples/minimal.py) | The four calls above with the predictions and the loss curves written to a `results/` folder. `python examples/minimal.py --demo` runs it on a small synthetic dataset generated on the fly by `ph.datasets.synthetic`, so nothing needs downloading. |
 | [`examples/train_abca2_supertype.py`](examples/train_abca2_supertype.py) | The Zhuang MERFISH atlas of the adult mouse brain (ABCA-2, 66 sections, 1.2 M cells) mapped to the 1 195 supertypes of the Yao 2023 taxonomy, then backtracked to subclasses and classes. |
 | [`examples/p1pup_mapping.ipynb`](examples/p1pup_mapping.ipynb) | A whole Xenium Prime section of a newborn mouse (1.3 M cells, 5 010 genes) mapped to 181 cell types of a whole-body reference, with the figures of the manuscript. |
 

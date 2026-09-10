@@ -1,9 +1,9 @@
 """Minimal PointillHist run: graphs -> network -> train -> predict -> save.
 
-Edit the paths below (relative to the working directory) and run it with a Python that has
-the packages of docs/environment.md.
-`python examples/minimal.py --demo` runs the same steps on the synthetic dataset
-of tests/_dataset.py instead (about a minute on CPU).
+Edit the paths below (relative to the working directory) and run it in an environment where
+PointillHist is installed (see the README).
+`python examples/minimal.py --demo` runs the same steps on the synthetic dataset of
+``pointillhist.datasets`` instead (well under a minute on CPU).
 """
 import os
 import sys
@@ -16,8 +16,6 @@ import torch
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
-HERE = os.path.dirname(os.path.abspath(__file__))
-sys.path.insert(0, os.path.abspath(os.path.join(HERE, "..", "..")))
 import pointillhist as ph
 
 # ---- inputs ---------------------------------------------------------------
@@ -34,18 +32,16 @@ TRAIN_KWARGS = dict(cell_loss_type="zip", num_epochs=100)
 
 if "--demo" in sys.argv:
     import tempfile
-    sys.path.insert(0, os.path.join(HERE, "..", "tests"))
-    import _dataset
 
     OUT_DIR = tempfile.mkdtemp(prefix="pointillhist_demo_")
-    REFERENCE, SPATIAL_PATHS = _dataset.build(OUT_DIR)
-    TIMEPOINTS, REGION_KEY = list(_dataset.TIMEPOINTS), "region"
+    REFERENCE, SPATIAL_PATHS = ph.datasets.synthetic(OUT_DIR)
+    TIMEPOINTS, REGION_KEY = list(ph.datasets.TIMEPOINTS), "region"
     reference = pd.read_csv(REFERENCE, index_col=0)
     # true composition of each section as a cell types x timepoint-labels count table
     TYPE_PRIORS = pd.DataFrame({tp: ad.read_h5ad(p).obs["true_label"].value_counts()
                                 for p, tp in zip(SPATIAL_PATHS, TIMEPOINTS)}).fillna(0)
     TYPE_PRIORS.index = [f"type_{k}" for k in TYPE_PRIORS.index]
-    TYPE_REGIONS = pd.DataFrame(1.0, index=reference.index, columns=list(_dataset.REGIONS))
+    TYPE_REGIONS = pd.DataFrame(1.0, index=reference.index, columns=list(ph.datasets.REGIONS))
     GRAPH_KWARGS = dict(tile_side=200, min_cells=20, min_dots=10, grid_spacing=40,
                         cell_cell_k_neighbors=8, cell_cell_maxdist=120, fraction_overlap=0.0,
                         counts_min_cell=-1, coarse_grid_side=4)
