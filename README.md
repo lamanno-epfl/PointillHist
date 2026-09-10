@@ -41,10 +41,6 @@ in the **[installation guide](guide/installation.md)**:
 - **uv**, from a clone, with the versions pinned in `uv.lock`: `uv sync --all-extras`
 - **conda**, letting conda provide Python and pip install the package as above.
 
-The guide also covers the optional extras (`umap`, `examples`), CPU-only and specific CUDA
-builds of `torch`, and how to check the installation with `python examples/minimal.py --demo`.
-[`docs/environment.md`](docs/environment.md) lists the supported and tested versions.
-
 ## Quick start
 
 Four calls take a dataset from files to a cell type per cell.
