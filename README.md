@@ -16,13 +16,15 @@
 
 ---
 
-PointillHist assigns a cell type to every cell of a spatial transcriptomics dataset from a
-single-cell reference alone: a table of mean expression per cell type is the only
-supervision. Instead of classifying each cell on its own, it trains a graph transformer on
-tiles of the tissue in which every cell is embedded together with its neighbours and with a
-coarse grid that summarises the composition of its surroundings, so each assignment is
-consistent with its spatial context. It scales to millions of cells and trains several
-sections, timepoints and conditions together.
+PointillHist is a scalable reference-mapping tool for spatial transcriptomics. It transfers
+the cell identities of a single-cell reference, given as a table of mean expression per cell
+type, onto every cell of a spatial dataset, and it learns on the tissue itself how those
+identities are laid out in space. Instead of classifying each cell on its own, it trains a
+graph transformer on tiles of the tissue in which every cell is embedded together with its
+neighbours and with a coarse grid that summarises the composition of its surroundings, so
+each assignment is consistent with its spatial context. It maps millions of cells, trains
+several sections, timepoints and conditions together, and remains accurate with references
+of thousands of cell types, separating transcriptionally close subtypes.
 
 The method is described in
 [**Context-aware cell identity assignment maps the 3D cellular architecture of the human embryonic brain**](PAPER_URL_PLACEHOLDER).
