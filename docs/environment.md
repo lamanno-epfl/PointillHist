@@ -22,7 +22,7 @@ releases, and the two columns below are the two environments we use.
 | scikit-learn | >= 1.5 | 1.5.2 | 1.8.0 |
 | umap-learn (extra `umap`, for `ph.eval.umap`) | >= 0.5 | 0.5.7 | 0.5.9 |
 | openpyxl (extra `examples`, for the ABCA-2 example) | >= 3.1 | 3.1.5 | 3.1.5 |
-| pyarrow (extra `examples`, for the parquet output of `minimal.py`) | >= 17 | 17.0.0 | 20.0.0 |
+| ipykernel (extra `examples`, to run the example notebooks) | >= 6 | 6.29.5 | 6.29.5 |
 
 `pandas` stays below 3.0 for now: pandas 3 changes the default string dtype, and the
 molecule-table (`dots.csv`, `cells.csv`) path of `generate_graphs` fails on it; the AnnData
@@ -31,12 +31,12 @@ path works.
 [`uv.lock`](../uv.lock) is a locked resolution of these ranges for `uv sync`, computed
 separately for Python 3.10, 3.11 and 3.12 or newer, so the versions it installs depend on the
 Python minor (in September 2026: torch 2.14, PyTorch Geometric 2.8, pandas 2.3 and anndata
-0.11 to 0.13). We ran the demo and our internal tests on all three resolutions, with Python
-3.10 to 3.14, on the GPU for Python 3.12. `uv lock --upgrade` refreshes it.
+0.11 to 0.13). We ran our internal tests on all three resolutions, with Python 3.10 to 3.14,
+on the GPU for Python 3.12. `uv lock --upgrade` refreshes it.
 
 PyTorch Geometric's compiled extensions (`pyg_lib`, `torch_scatter`, `torch_sparse`,
 `torch_cluster`) are not required: PointillHist uses only the pure-Python parts of the
-library, and `examples/minimal.py --demo` and our internal tests run without them. They are
+library, and the example notebook and our internal tests run without them. They are
 optional accelerators (`pyg_lib` speeds up the `HeteroLinear` layers PointillHist uses). The
 wheels on [data.pyg.org](https://data.pyg.org/whl/) are built per `torch` and CUDA version and
 indexed by `torch.__version__`, so the URL must match the `torch` you have; for the `torch`

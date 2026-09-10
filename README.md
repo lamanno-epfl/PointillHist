@@ -94,12 +94,13 @@ every per-cell and per-grid-node entry is a NumPy array, ready for `pandas` or `
 
 | example | what it shows |
 |---|---|
-| [`examples/minimal.py`](examples/minimal.py) | The four calls above with the predictions and the loss curves written to a `results/` folder. `python examples/minimal.py --demo` runs it on a small synthetic dataset generated on the fly by `ph.datasets.synthetic`, so nothing needs downloading; the demo writes to a temporary directory whose path is printed at the end. |
+| [`examples/minimal.ipynb`](examples/minimal.ipynb) | Start here. A skin section simulated with PointillSim, the framework of the manuscript (7 542 cells, 19 types, 200 genes, about 19 transcripts per cell; the data are in [`examples/data/skin`](examples/data/skin)), mapped with the four calls above (with `cell_loss_type="poisson"` and `lambda_density=10`, the value the hyperparameter guide recommends for a reference with dozens of types) and scored against the ground truth: accuracy, macro and weighted F1, precision and recall, confusion matrix and maps. Under a minute on a GPU, about two on the CPU. |
+| [`examples/minimal.py`](examples/minimal.py) | A demonstration of the optional inputs in one run: several sections with a timepoint label each, per-cell region labels with a cell types × regions table for the anatomical prior, and expected proportions per timepoint as the type prior. `python examples/minimal.py --demo` runs it on a small synthetic dataset that the script generates itself, writing to a temporary directory whose path is printed at the end. |
 | [`examples/train_abca2_supertype.py`](examples/train_abca2_supertype.py) | The Zhuang MERFISH atlas of the adult mouse brain (ABCA-2, 66 sections, 1.2 M cells) mapped to the 1 195 supertypes of the Yao 2023 taxonomy, then backtracked to subclasses and classes. |
 | [`examples/p1pup_mapping.ipynb`](examples/p1pup_mapping.ipynb) | A whole Xenium Prime section of a newborn mouse (1.3 M cells, 5 010 genes) mapped to 181 cell types of a whole-body reference, with the figures of the manuscript. |
 
 The two dataset examples expect the public data to be downloaded; their headers say where
-the files are read from. The notebook additionally reads three project-specific files from a
+the files are read from. `p1pup_mapping.ipynb` additionally reads three project-specific files from a
 `figures/` folder next to it (the cell-type palette, a UMAP of the reference cells and a
 cached segmentation for the region insets); they serve only the manuscript figures and are
 not part of the repository.

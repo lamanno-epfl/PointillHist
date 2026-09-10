@@ -14,3 +14,4 @@ build/
 results/
 checkpoints/
 .ipynb_checkpoints/
+*.nbconvert.ipynb

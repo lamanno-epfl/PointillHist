@@ -7,10 +7,10 @@ PointillHist is a pure-Python package for Python 3.10 or later. Its dependencies
 GPUs; training on the CPU works but is slow. The supported version ranges, the tested
 environments and the platform notes are in [`docs/environment.md`](../docs/environment.md).
 
-Two extras exist: `umap` adds `umap-learn` for `ph.eval.umap`, and `examples` adds `openpyxl`
-(the ABCA-2 example reads its taxonomy from an Excel sheet) and `pyarrow` (parquet output of
-`examples/minimal.py`). Add them as `pointillhist[umap,examples]` in the commands below, or
-leave them out.
+Two extras exist: `umap` adds `umap-learn` for `ph.eval.umap`, and `examples` adds
+`ipykernel`, to run the example notebooks, and `openpyxl`, which the ABCA-2 example needs to
+read its taxonomy from an Excel sheet. Add them as `pointillhist[umap,examples]` in the
+commands below, or leave them out.
 
 ## With pip
 
@@ -31,11 +31,11 @@ From a clone, with the versions pinned in [`uv.lock`](../uv.lock):
 git clone https://github.com/lamanno-epfl/PointillHist.git
 cd PointillHist
 uv sync --all-extras                          # creates .venv with the locked versions
-uv run python examples/minimal.py --demo      # or: source .venv/bin/activate
+uv run python -c "import pointillhist"        # or: source .venv/bin/activate
 ```
 
-The lock is resolved separately for Python 3.10, 3.11 and 3.12 or newer, and we run the demo
-and our internal tests on all three. It pins the CUDA 13 build of `torch`; for another build
+The lock is resolved separately for Python 3.10, 3.11 and 3.12 or newer, and we run our
+internal tests on all three. It pins the CUDA 13 build of `torch`; for another build
 either skip the lock, in a plain virtual environment from the same clone,
 
 ```bash
@@ -80,11 +80,18 @@ because `torch` 2.4 and later ship no wheels for them. Details in
 
 ```bash
 python -c "import pointillhist as ph; print(ph.__version__)"
-python examples/minimal.py --demo      # from a clone
 ```
 
-The demo trains on a small synthetic dataset, GPU or not, and ends with a line like
-`640 cells predicted; outputs in /tmp/pointillhist_demo_...` in well under a minute.
+must print the version. Then open [`examples/minimal.ipynb`](../examples/minimal.ipynb) from a
+clone in Jupyter or VS Code (the `examples` extra provides the kernel) and run it: it maps the
+PointillSim skin section shipped in `examples/data/skin` and scores the result against the
+ground truth, in under a minute on a GPU and about two minutes on the CPU. Headless, from the
+clone (`jupyter execute` runs the notebook without writing a copy):
+
+```bash
+pip install nbclient && jupyter execute examples/minimal.ipynb                          # pip / conda
+uv pip install nbclient && uv run --no-sync jupyter execute examples/minimal.ipynb      # uv project
+```
 
 ## Optional accelerators and the manuscript environment
 

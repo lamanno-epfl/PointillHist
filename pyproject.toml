@@ -45,9 +45,9 @@ dependencies = [
 [project.optional-dependencies]
 # ph.eval.umap
 umap = ["umap-learn>=0.5"]
-# examples/train_abca2_supertype.py reads the taxonomy from an Excel sheet;
-# examples/minimal.py writes the predictions as parquet when pyarrow is present.
-examples = ["openpyxl>=3.1", "pyarrow>=17"]
+# ipykernel runs the example notebooks; examples/train_abca2_supertype.py reads
+# the taxonomy from an Excel sheet.
+examples = ["openpyxl>=3.1", "ipykernel>=6"]
 
 [project.urls]
 Homepage = "https://github.com/lamanno-epfl/PointillHist"
