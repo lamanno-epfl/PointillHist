@@ -15,15 +15,18 @@ keywords = ["spatial transcriptomics", "cell typing", "cell type mapping", "grap
 classifiers = [
     "Development Status :: 4 - Beta",
     "Intended Audience :: Science/Research",
-    "Operating System :: OS Independent",
+    "Operating System :: POSIX :: Linux",
     "Programming Language :: Python :: 3",
     "Programming Language :: Python :: 3.10",
     "Programming Language :: Python :: 3.11",
     "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: 3.14",
     "Topic :: Scientific/Engineering :: Bio-Informatics",
 ]
-# Lower bounds are the versions the manuscript results were produced with
-# (docs/environment.md); the package is also tested on the current releases.
+# Lower bounds are at or below the versions the manuscript results were produced
+# with (docs/environment.md) and were verified at exactly these floors; the package
+# is also tested on the current releases. pandas 3 breaks the dots/cells-csv path.
 # PyTorch Geometric's compiled extensions (pyg_lib, torch_scatter, torch_sparse,
 # torch_cluster) are optional accelerators and deliberately not required.
 dependencies = [

@@ -3,7 +3,8 @@
 Every setting below has a default that works for typical imaging-based datasets. Start
 from the defaults, look at the loss curves and the assignment, and change one setting at a
 time. The three families follow the three calls that take settings: `generate_graphs`,
-`networks` and `train` (`predict` needs none).
+`networks` and `train`; `predict` has nothing to tune (its only option, `top_k`, chooses
+between the sparse top-5 and the dense form of `all_probs`, see the README).
 
 ## Graph generation — `ph.pp.generate_graphs`
 
@@ -33,7 +34,7 @@ changing.
 
 | parameter | default | how to set it |
 |---|---|---|
-| `cell_loss_type` | `"zip"` | Likelihood of the counts. `"zip"` (zero-inflated Poisson) for imaging-based data (MERFISH, Xenium, HybISS, EEL) or hundreds of cell types; `"nb"` or `"zinb"` might be a better model when counts are over-dispersed; `"poisson"` for plain counts; `"gamma"`, `"normal"` or `"log-normal"` for continuous values such as protein intensities. |
+| `cell_loss_type` | `"zip"` | Likelihood of the counts. `"zip"` (zero-inflated Poisson) for imaging-based data (MERFISH, Xenium, HybISS, EEL) or hundreds of cell types; `"nb"` or `"zinb"` might be a better model when counts are over-dispersed; `"poisson"` for plain counts; `"normal"` or `"log-normal"` for continuous values such as protein intensities. |
 | `lambda_cell_to_grid` | `10` | Weight of the per-cell likelihood relative to the grid (composition) term. Lower it for sparse datasets with few transcripts per cell, where the counts of a single cell are noisy and the pooled composition of the grid should carry more weight. |
 | `lambda_density` | `100` | Weight of the KL term that pulls the overall type composition of each tile towards the prior. Set it high, we suggest 100, for references with hundreds of types; it is annealed down during training (constant for the first half of the epochs, then a cosine decay to a tenth, `lambda_density_min`). For references with dozens of types set it lower, we suggest 10. |
 | `type_priors`, `prior_uniform_mix` | `"uniform"`, `0.95` | The prior composition. `"uniform"` is a maximum-entropy prior that keeps every type in play. Pass a table of cell types × timepoint labels (counts or proportions, csv or `DataFrame`) when the expected composition of each stage is known, for example from the reference atlas itself; `prior_uniform_mix` mixes it with 5 % uniform so that no type is ruled out. |

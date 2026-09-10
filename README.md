@@ -35,15 +35,19 @@ PointillHist is a pure-Python package for Python 3.10 or later. Its dependencies
 `torch`, `torch_geometric`, `anndata`, `numpy`, `scipy`, `pandas`, `tqdm`, `matplotlib`,
 `seaborn` and `scikit-learn`; the compiled extensions of PyTorch Geometric (`pyg_lib`,
 `torch_scatter`, ...) are not needed. Two extras exist: `umap` for the optional embedding of
-the predictions (`ph.eval.umap`) and `examples` for the two dataset examples.
+the predictions (`ph.eval.umap`) and `examples` for the optional dependencies of the example
+scripts (`openpyxl` for the ABCA-2 taxonomy sheet, `pyarrow` for the parquet output of
+`minimal.py`).
 
-**pip**, into an existing environment (on Linux the `torch` wheel from PyPI includes CUDA):
+**pip**, into an existing environment that has `git` on its PATH (on Linux the `torch` wheel
+from PyPI includes CUDA; see the note on NVIDIA drivers below):
 
 ```bash
 pip install "pointillhist[umap,examples] @ git+https://github.com/lamanno-epfl/PointillHist.git"
 ```
 
-**uv**, from a clone, with the exact versions we test with taken from [`uv.lock`](uv.lock):
+**uv**, from a clone, with the versions pinned in [`uv.lock`](uv.lock), resolved separately
+for Python 3.10, 3.11 and 3.12 or newer; we run the demo and our internal tests on all three:
 
 ```bash
 git clone https://github.com/lamanno-epfl/PointillHist.git
@@ -52,19 +56,24 @@ uv sync --all-extras                          # creates .venv with the locked ve
 uv run python examples/minimal.py --demo      # or: source .venv/bin/activate
 ```
 
-**conda**, letting conda provide Python and pip the packages, because PyTorch Geometric has
-no conda packages for recent PyTorch versions:
+**conda**, letting conda provide Python and pip the packages (PointillHist itself is not on
+conda, and the PyPI builds of `torch` and `torch_geometric` are the ones we test):
 
 ```bash
-conda create -n pointillhist python=3.11
+conda create -n pointillhist python=3.11 git      # git: pip installs from the git URL below
 conda activate pointillhist
 pip install "pointillhist[umap,examples] @ git+https://github.com/lamanno-epfl/PointillHist.git"
 ```
 
-For a CPU-only machine or a specific CUDA version, install `torch` first following
-[pytorch.org](https://pytorch.org/get-started/locally/) and then PointillHist as above.
-[`docs/environment.md`](docs/environment.md) lists the supported version ranges and the
-versions the manuscript results were produced with.
+The `torch` that PyPI serves by default is a CUDA 13 build (2.14.0+cu130 in September 2026)
+and needs an NVIDIA driver of version 580 or newer (`nvidia-smi` prints it); with an older
+driver the installation succeeds but `torch.cuda.is_available()` is `False`. In that case, on
+a CPU-only machine, or for a specific CUDA version, install `torch` first following
+[pytorch.org](https://pytorch.org/get-started/locally/), for example
+`pip install torch --index-url https://download.pytorch.org/whl/cu126`, and then PointillHist
+with pip as above. The uv equivalent is in [`docs/environment.md`](docs/environment.md), which
+also lists the supported version ranges, the platforms we test on and the versions the
+manuscript results were produced with.
 
 To check the installation, `python -c "import pointillhist as ph; print(ph.__version__)"`
 must print the version, and `python examples/minimal.py --demo` (from a clone) runs the
@@ -116,18 +125,22 @@ other section must contain them, and genes outside the reference are ignored.
 probabilities renormalised to sum 1 as a `scipy.sparse` matrix (`all_probs`; `top_k=None`
 keeps every probability in a dense array), positions, section and timepoint labels, and the
 cell embeddings; plus the embeddings and positions of the grid nodes. Apart from `all_probs`
-everything is a NumPy array, ready for `pandas` or `pickle`.
+every per-cell and per-grid-node entry is a NumPy array, ready for `pandas` or `pickle`;
+`cell_types`, `section_ids` and `label_list` are plain lists.
 
 ## Examples
 
 | example | what it shows |
 |---|---|
-| [`examples/minimal.py`](examples/minimal.py) | The four calls above with the predictions and the loss curves written to a `results/` folder. `python examples/minimal.py --demo` runs it on a small synthetic dataset generated on the fly by `ph.datasets.synthetic`, so nothing needs downloading. |
+| [`examples/minimal.py`](examples/minimal.py) | The four calls above with the predictions and the loss curves written to a `results/` folder. `python examples/minimal.py --demo` runs it on a small synthetic dataset generated on the fly by `ph.datasets.synthetic`, so nothing needs downloading; the demo writes to a temporary directory whose path is printed at the end. |
 | [`examples/train_abca2_supertype.py`](examples/train_abca2_supertype.py) | The Zhuang MERFISH atlas of the adult mouse brain (ABCA-2, 66 sections, 1.2 M cells) mapped to the 1 195 supertypes of the Yao 2023 taxonomy, then backtracked to subclasses and classes. |
 | [`examples/p1pup_mapping.ipynb`](examples/p1pup_mapping.ipynb) | A whole Xenium Prime section of a newborn mouse (1.3 M cells, 5 010 genes) mapped to 181 cell types of a whole-body reference, with the figures of the manuscript. |
 
 The two dataset examples expect the public data to be downloaded; their headers say where
-the files are read from.
+the files are read from. The notebook additionally reads three project-specific files from a
+`figures/` folder next to it (the cell-type palette, a UMAP of the reference cells and a
+cached segmentation for the region insets); they serve only the manuscript figures and are
+not part of the repository.
 
 ## Hyperparameters
 
