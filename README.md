@@ -1,7 +1,7 @@
 <p align="center">
   <picture>
-    <source media="(prefers-color-scheme: dark)" srcset="docs/logo_dark.svg">
-    <img src="docs/logo.svg" alt="PointillHist" width="300">
+    <source media="(prefers-color-scheme: dark)" srcset="assets/logo_dark.svg">
+    <img src="assets/logo.svg" alt="PointillHist" width="300">
   </picture>
 </p>
 
@@ -119,6 +119,10 @@ If training runs out of memory in the first epoch, the tiles themselves are too 
 `tile_side` in `generate_graphs` so that every graph and its working set become smaller. If
 it happens later, after the graphs were moved to the GPU, force the copying mode with
 `keep_on_device=False` in `train`.
+
+For fully deterministic GPU runs, follow the short
+[reproducibility setup](environments.md#reproducibility). It combines fixed random seeds
+with PyTorch deterministic algorithms, which can make training slower.
 
 ## Citation
 
