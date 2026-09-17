@@ -97,12 +97,24 @@ def _resident_bytes(graphs):
 
 
 def _to_device(graphs, device):
-    """The graphs kept on ``device``: a list is moved in place, a DiskGraphs is loaded graph by graph."""
+    """The graphs kept on ``device``: a list is moved in place, a DiskGraphs is loaded graph by graph
+    (without the per-cell ids, which training does not use and which would stay in host memory)."""
     if isinstance(graphs, DiskGraphs):
-        return [graph.to(device) for graph in graphs]
+        kept = []
+        for graph in graphs:
+            graph._global_store.pop("unique_cell_ids", None)
+            kept.append(graph.to(device))
+        return kept
     for graph in graphs:
         graph.to(device)
     return graphs
+
+
+def _first(graphs, name, *default):
+    """An attribute of the first graph; a DiskGraphs reads cell_types, genes and regions from its index."""
+    if isinstance(graphs, DiskGraphs) and name in ("cell_types", "genes", "regions"):
+        return getattr(graphs, name)
+    return getattr(graphs[0], name, *default)
 
 
 def _setup_subset(graphs, setup_graphs):
@@ -131,7 +143,7 @@ def _reference(reference, graphs):
     if isinstance(reference, (torch.Tensor, np.ndarray)):
         return torch.as_tensor(reference, dtype=torch.float32)
     table = load_reference(reference)
-    return torch.tensor(table.loc[graphs[0].cell_types, graphs[0].genes].values, dtype=torch.float32)
+    return torch.tensor(table.loc[_first(graphs, "cell_types"), _first(graphs, "genes")].values, dtype=torch.float32)
 
 
 def _type_priors(type_priors, graphs):
@@ -141,7 +153,7 @@ def _type_priors(type_priors, graphs):
             'type_priors must be "uniform", a DataFrame/csv path (cell types x timepoint '
             "labels) or a (K,) array/Series/tensor, not None"
         )
-    cell_types = list(graphs[0].cell_types)
+    cell_types = list(_first(graphs, "cell_types"))
     K = len(cell_types)
     labels = dict(zip(_graph_values(graphs, "timepoint"), _graph_values(graphs, "timepoint_label")))
     n_timepoints = max(labels) + 1
@@ -188,16 +200,17 @@ def _type_regions(type_regions, graphs):
     """(K, n_regions) float tensor aligned to the graphs' cell types and regions, or None."""
     if type_regions is None:
         return None
-    regions = getattr(graphs[0], "regions", None)
+    regions = _first(graphs, "regions", None)
     if regions is None:
         raise ValueError("graphs carry no cell regions; pass region_key= to generate_graphs")
     if isinstance(type_regions, str):
         type_regions = pd.read_csv(type_regions, index_col=0)
+    cell_types = _first(graphs, "cell_types")
     if isinstance(type_regions, pd.DataFrame):
         # cell_types and regions are str, so cast the table's labels too
-        type_regions = type_regions.rename(index=str, columns=str).loc[list(graphs[0].cell_types), regions].values
+        type_regions = type_regions.rename(index=str, columns=str).loc[list(cell_types), regions].values
     type_regions = torch.as_tensor(type_regions, dtype=torch.float32)
-    expected = (len(graphs[0].cell_types), len(regions))
+    expected = (len(cell_types), len(regions))
     if tuple(type_regions.shape) != expected:
         raise ValueError(
             f"type_regions must have shape (n_cell_types, n_regions) = {expected}, "

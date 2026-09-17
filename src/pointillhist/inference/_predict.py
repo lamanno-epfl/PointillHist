@@ -1,6 +1,11 @@
+import bisect
 import json
+import math
 import os
+import time
+import warnings
 from collections import defaultdict
+from collections.abc import Iterable
 
 import numpy as np
 import torch
@@ -8,7 +13,7 @@ import torch.distributed as dist
 import tqdm
 from scipy import sparse
 
-from ..preprocessing._store import _graph_values
+from ..preprocessing._store import DiskGraphs, _graph_values
 
 __all__ = ["predict", "read_predictions", "cell_cell_interactions", "umap"]
 
@@ -40,6 +45,9 @@ COMPACT_FIELDS = ("all_cell_types", "all_probs", "all_positions", "unique_cell_i
                   "all_sections", "all_timepoints", "all_conditions")
 FORMAT = 1
 META_FILE = "predictions.pt"
+#: a row group of the Parquet parts is written once it holds this many bytes or rows
+ROW_GROUP_BYTES = 64 * 2**20
+ROW_GROUP_ROWS = 1_000_000
 
 
 def _fields(fields, default):
@@ -66,8 +74,9 @@ def _section_ids(labels_and_counts):
     return list(np.unique(np.hstack([_labels_array(label, min(n, 1)) for label, n in labels_and_counts])))
 
 
-def _predict_graph(net, graph, device, temperature, top_k, wanted):
-    """The outputs of one graph for its core cells (numpy / scipy), restricted to ``wanted`` plus the labels."""
+def _predict_graph(net, graph, device, temperature, top_k, wanted, restore=True):
+    """The outputs of one graph for its core cells (numpy / scipy), restricted to ``wanted`` plus the labels.
+    The graph is moved to ``device`` and, with ``restore``, back to the CPU afterwards."""
     graph.to(device)
     counts, logits, out_cell, out_grid, scale, _ = net(graph)
     is_core = graph["cells"].is_core
@@ -94,7 +103,8 @@ def _predict_graph(net, graph, device, temperature, top_k, wanted):
     if "unique_cell_ids" in wanted:
         piece["unique_cell_ids"] = np.asarray(graph.unique_cell_ids)[is_core.detach().cpu().numpy()]
     piece["all_labels"] = torch.argmax(logits[is_core], dim=1).cpu().numpy()
-    graph.to("cpu")
+    if restore:
+        graph.to("cpu")
     piece["labels"] = (graph.section_label, graph.timepoint_label, graph.condition_label)
     return piece
 
@@ -145,18 +155,23 @@ def predict(net, graphs, top_k=5, out=None, fields=None):
             to sum 1, and return ``all_probs`` as a ``scipy.sparse`` CSR matrix
             (cells x types) instead of a dense array; ``None`` keeps every probability
             in a dense array. ``all_labels`` is the argmax either way.
-        out: None (default) returns the outputs in memory. A folder (absent or empty)
-            writes them there graph by graph, so memory holds one graph's outputs at a
-            time (needs ``pyarrow``, the ``parquet`` extra); read them back with
-            ``read_predictions``. ``<out>/cells`` is a Parquet dataset with one row per
-            core cell (graph, label, cell_type, cell_id, section, timepoint, condition,
-            x, y[, z], top_types / top_probs or probs, and logits, scale, expression,
-            embedding when asked for), readable directly with
-            ``pandas.read_parquet``; ``<out>/grid`` holds the grid-node fields, if any
-            were asked for; ``predictions.pt`` the rest. Under torchrun
-            (a process group initialised, e.g. by ``train_distributed``) every process
-            must call ``predict`` with the same ``out``: each one predicts its share of
-            the graphs on its own device.
+        out: None (default) returns the outputs in memory. A folder that does not exist
+            or is empty: the outputs are written there graph by graph, so memory holds one
+            graph's outputs at a time (needs ``pyarrow``, the ``parquet`` extra); read
+            them back with ``read_predictions``. ``<out>/cells`` is a Parquet dataset with
+            one row per core cell, readable directly with ``pandas.read_parquet``: graph
+            (position in ``graphs``), label (index into ``cell_types``), cell_type,
+            cell_id (as text), section, timepoint, condition (as text), x, y[, z];
+            top_types and top_probs, the ``top_k`` most probable type indices and their
+            renormalised probabilities, most probable first (probs, every probability,
+            with ``top_k=None``); and logits, scale, expression, embedding when asked
+            for. ``<out>/grid`` holds the grid-node fields, if any were asked for, and
+            ``predictions.pt`` the rest (the cell types among them). If writing fails,
+            what was written is removed. Under torchrun (a process group initialised,
+            e.g. by ``train_distributed``) every process must call ``predict`` with the
+            same ``out`` and the same graphs: each one predicts its share of the graphs
+            on the device of its ``net`` and writes one part, then returns; process 0
+            returns once every part is written and the output is complete.
         fields: The optional entries to return or write (see below). None: all of them
             in memory; with ``out``, only ``all_cell_types``, ``all_probs``,
             ``all_positions``, ``unique_cell_ids``, ``all_sections``,
@@ -191,10 +206,11 @@ def predict(net, graphs, top_k=5, out=None, fields=None):
 
     pieces = []
     net.eval()
+    # a list's graphs are moved back to the CPU as before; a DiskGraphs graph is dropped once predicted
+    restore = not isinstance(graphs, DiskGraphs)
     with torch.no_grad():
-        for graph in tqdm.tqdm(graphs, desc="Predicting"):
-            pieces.append(_predict_graph(net, graph, device, temperature, top_k, wanted))
-            del graph   # a DiskGraphs graph is released before the next one is loaded
+        for i in tqdm.tqdm(range(len(graphs)), desc="Predicting"):
+            pieces.append(_predict_graph(net, graphs[i], device, temperature, top_k, wanted, restore))
     return _assemble(pieces, cell_types, top_k, wanted)
 
 
@@ -220,19 +236,26 @@ def _temporary(path):
     return os.path.join(folder, f"_{name}.tmp{os.getpid()}")
 
 
-def _finished_output(out):
-    """Why ``out`` cannot receive predictions (an empty string if it can)."""
+def _is_temporary(name):
+    return name.startswith("_part-") and ".parquet.tmp" in name
+
+
+def _output_problem(out):
+    """Why ``out`` cannot receive predictions (an empty string if it can): it must be absent, empty,
+    or hold nothing but the temporary parts an interrupted ``predict`` may have left."""
     if not os.path.exists(out):
         return ""
     if not os.path.isdir(out):
         return f"{out} exists and is not a folder"
     names = os.listdir(out)
+    inner = []
     for kind in ("cells", "grid"):
-        folder = os.path.join(out, kind)
-        if os.path.isdir(folder):
-            names += os.listdir(folder)
-    if META_FILE in names or any(n.endswith(".parquet") for n in names):
+        if kind in names and os.path.isdir(os.path.join(out, kind)):
+            inner += os.listdir(os.path.join(out, kind))
+    if META_FILE in names or any(n.endswith(".parquet") for n in inner):
         return f"{out} already holds predictions; remove it or choose another folder"
+    if set(names) - {"cells", "grid"} or not all(_is_temporary(n) for n in inner):
+        return f"{out} is not empty; predictions are written to a new or empty folder"
     return ""
 
 
@@ -292,8 +315,15 @@ def _tables(pa, piece, position, schema, grid_schema, axes):
         columns["cell_type"] = pa.array(piece["cell_types"], type=pa.string())
     if "cell_id" in names:
         ids = piece["unique_cell_ids"]
-        columns["cell_id"] = pa.array([str(i) for i in ids] if ids.dtype == object else ids.astype(str),
-                                      type=pa.string())
+        if ids.dtype != object:
+            columns["cell_id"] = pa.array(ids.astype(str), type=pa.string())
+        else:
+            try:   # str, with None / NaN for missing ids (written as nulls)
+                columns["cell_id"] = pa.array(ids, type=pa.string(), from_pandas=True)
+            except (TypeError, ValueError, pa.ArrowException):   # objects other than str
+                warnings.warn("cell ids that are not strings are written, and read back, as text")
+                piece["ids_as_text"] = True
+                columns["cell_id"] = pa.array([None if _missing(i) else str(i) for i in ids], type=pa.string())
     for column, value in (("section", section), ("timepoint", timepoint), ("condition", condition)):
         if column in names:
             columns[column] = pa.array([value] * n, type=pa.string())
@@ -304,10 +334,13 @@ def _tables(pa, piece, position, schema, grid_schema, axes):
     if "probs" in names:
         columns["probs"] = _fixed_list(pa, piece["all_probs"], schema.field("probs").type.list_size, pa.float32())
     if "top_types" in names:
-        matrix = piece["all_probs"]
+        matrix = piece["all_probs"]   # k entries per row, in type order
         k = schema.field("top_types").type.list_size
-        columns["top_types"] = _fixed_list(pa, matrix.indices.astype(np.int32), k, pa.int32())
-        columns["top_probs"] = _fixed_list(pa, matrix.data, k, pa.float32())
+        probs, types = matrix.data.reshape(-1, k), matrix.indices.reshape(-1, k)
+        order = np.argsort(-probs, axis=1, kind="stable")   # most probable first
+        columns["top_types"] = _fixed_list(pa, np.take_along_axis(types, order, axis=1).astype(np.int32), k,
+                                           pa.int32())
+        columns["top_probs"] = _fixed_list(pa, np.take_along_axis(probs, order, axis=1), k, pa.float32())
     for field, column in (("all_logits", "logits"), ("expression_matrices", "expression"),
                           ("embeddings_cell", "embedding")):
         if column in names:
@@ -332,17 +365,60 @@ def _tables(pa, piece, position, schema, grid_schema, axes):
     return cells, grid
 
 
+def _missing(value):
+    return value is None or (isinstance(value, float) and math.isnan(value))
+
+
+def _rows_path(out, rank, world_size):
+    return os.path.join(out, f"_rows-{rank:05d}-of-{world_size:05d}.pt")
+
+
 def _predict_to_parquet(net, graphs, positions, top_k, out, wanted, device, temperature, cell_types):
     pa, pq = _pyarrow()
+    top_k = None if top_k is None else int(top_k)
     distributed = dist.is_available() and dist.is_initialized()
+    if not distributed and int(os.environ.get("WORLD_SIZE", 1)) > 1:
+        raise RuntimeError("predict(out=) runs under torchrun without a process group: every process would "
+                           "predict everything into the same files. Create the group first "
+                           "(torch.distributed.init_process_group(), or train_distributed, which creates it).")
     rank, world_size = (dist.get_rank(), dist.get_world_size()) if distributed else (0, 1)
-    problem = [_finished_output(out) if rank == 0 else None]
-    if distributed:
+    if distributed and device.type == "cuda" and dist.get_backend() == "nccl":
+        torch.cuda.set_device(device)   # the object collective below runs on the current device
+    problem = [_output_problem(out) if rank == 0 else None]
+    if distributed:   # the only collective: every process starts predict at the same point
         dist.broadcast_object_list(problem, src=0)
     if problem[0]:
         raise FileExistsError(problem[0])
-    os.makedirs(out, exist_ok=True)
+    created = [folder for folder in (out, os.path.join(out, "cells"), os.path.join(out, "grid"))
+               if not os.path.exists(folder)]
+    try:
+        details = _write_parts(pa, pq, net, graphs, positions, top_k, out, wanted, device, temperature,
+                               cell_types, rank, world_size)
+    except BaseException:
+        for kind in ("cells", "grid"):
+            _remove(_temporary(_shard_path(out, kind, rank, world_size)))
+        for folder in reversed(created):
+            try:
+                os.rmdir(folder)
+            except OSError:
+                pass
+        raise
+    if rank == 0:
+        _write_meta(out, graphs, world_size, details)
+    return out
 
+
+def _remove(path):
+    try:
+        os.remove(path)
+    except FileNotFoundError:
+        pass
+
+
+def _write_parts(pa, pq, net, graphs, positions, top_k, out, wanted, device, temperature, cell_types,
+                 rank, world_size):
+    """Predict this process's share of the graphs, write its Parquet parts, then the list of its graphs
+    (``_rows-<rank>``, which process 0 waits for)."""
     written = list(wanted)
     schema, grid_schema, axes = _schema(pa, written, top_k, len(cell_types), positions, net)
     info = json.dumps({"cell_types": cell_types, "fields": written, "top_k": top_k,
@@ -354,60 +430,88 @@ def _predict_to_parquet(net, graphs, positions, top_k, out, wanted, device, temp
         paths["grid"] = _shard_path(out, "grid", rank, world_size)
     for path in paths.values():
         os.makedirs(os.path.dirname(path), exist_ok=True)
-    writers = {kind: pq.ParquetWriter(_temporary(path), schema if kind == "cells" else grid_schema)
-               for kind, path in paths.items()}
+    writers, buffers = {}, {kind: [] for kind in paths}
     done = []
     names = np.asarray(cell_types)
+
+    def flush(kind):
+        if buffers[kind]:
+            table = pa.concat_tables(buffers[kind])
+            writers[kind].write_table(table, row_group_size=len(table))
+            buffers[kind] = []
+
     net.eval()
     try:
+        for kind, path in paths.items():
+            writers[kind] = pq.ParquetWriter(_temporary(path), schema if kind == "cells" else grid_schema)
         with torch.no_grad():
-            positions = range(rank, len(graphs), world_size)
-            for position in tqdm.tqdm(positions, desc="Predicting", disable=rank != 0):
-                piece = _predict_graph(net, graphs[position], device, temperature, top_k, set(written))
+            for position in tqdm.tqdm(range(rank, len(graphs), world_size), desc="Predicting", disable=rank != 0):
+                piece = _predict_graph(net, graphs[position], device, temperature, top_k, set(written),
+                                       restore=not isinstance(graphs, DiskGraphs))
                 if "all_cell_types" in written:
                     piece["cell_types"] = names[piece["all_labels"]]
-                cells, grid = _tables(pa, piece, position, schema, grid_schema, axes)
-                if len(cells):
-                    writers["cells"].write_table(cells, row_group_size=len(cells))
-                if grid is not None and len(grid):
-                    writers["grid"].write_table(grid, row_group_size=len(grid))
+                tables = dict(zip(("cells", "grid"), _tables(pa, piece, position, schema, grid_schema, axes)))
+                for kind in paths:
+                    if len(tables[kind]):
+                        buffers[kind].append(tables[kind])
+                    # several graphs per row group, so that the footer stays small
+                    if sum(t.nbytes for t in buffers[kind]) >= ROW_GROUP_BYTES or \
+                            sum(len(t) for t in buffers[kind]) >= ROW_GROUP_ROWS:
+                        flush(kind)
                 ids = piece.get("unique_cell_ids")
                 done.append((position, piece["n_cells"], piece["n_grid"],
-                             None if ids is None else ids.dtype.str if ids.dtype != object else "object"))
-                del piece, cells, grid
+                             None if ids is None else ids.dtype.str if ids.dtype != object else
+                             "object-as-text" if piece.get("ids_as_text") else "object"))
+                del piece, tables
+        for kind in paths:
+            flush(kind)
     finally:
         for writer in writers.values():
             writer.close()
-    for kind, path in paths.items():
+    for path in paths.values():
         os.replace(_temporary(path), path)
+    rows_path = _rows_path(out, rank, world_size)
+    torch.save(done, f"{rows_path}.tmp{os.getpid()}")
+    os.replace(f"{rows_path}.tmp{os.getpid()}", rows_path)
+    return dict(fields=written, top_k=top_k, cell_types=cell_types, axes=axes, grid=grid_schema is not None,
+                pos_dtype=_position_dtype(schema, grid_schema, axes), n_genes=net.n_genes,
+                hidden_size=net.hidden_size)
 
-    shares = [done]
-    if distributed:
-        shares = [None] * world_size
-        dist.all_gather_object(shares, done)
-    if rank == 0:
-        rows = sorted((row for share in shares for row in share), key=lambda row: row[0])
-        if [row[0] for row in rows] != list(range(len(graphs))):
-            raise RuntimeError("the processes did not predict every graph once; were the graphs the same everywhere?")
-        labels = zip(*(_graph_values(graphs, name) for name in ("section_label", "timepoint_label",
-                                                                 "condition_label")))
-        meta = {
-            "format": FORMAT, "n_graphs": len(graphs), "world_size": world_size, "fields": written,
-            "top_k": top_k, "cell_types": cell_types, "axes": axes, "grid": grid_schema is not None,
-            "pos_dtype": schema.field(axes[0]).type.to_pandas_dtype() if axes[0] in schema.names else
-            (grid_schema.field(axes[0]).type.to_pandas_dtype() if grid_schema is not None
-             and axes[0] in grid_schema.names else None),
-            "n_genes": net.n_genes, "hidden_size": net.hidden_size,
-            "graphs": [dict(section_label=s, timepoint_label=t, condition_label=c, n_cells=n, n_grid=m,
-                            ids_dtype=d)
-                       for (s, t, c), (_, n, m, d) in zip(labels, rows)],
-        }
-        tmp = os.path.join(out, f"{META_FILE}.tmp{os.getpid()}")
-        torch.save(meta, tmp)
-        os.replace(tmp, os.path.join(out, META_FILE))
-    if distributed:
-        dist.barrier()
-    return out
+
+def _position_dtype(schema, grid_schema, axes):
+    for table_schema in (schema, grid_schema):
+        if table_schema is not None and axes[0] in table_schema.names:
+            return table_schema.field(axes[0]).type.to_pandas_dtype()
+    return None
+
+
+def _write_meta(out, graphs, world_size, details):
+    """``predictions.pt``, written by process 0 once every process has written its part: the output is
+    complete when it exists."""
+    paths = [_rows_path(out, r, world_size) for r in range(world_size)]
+    last_note = time.monotonic()
+    while True:
+        missing = [path for path in paths if not os.path.exists(path)]
+        if not missing:
+            break
+        if time.monotonic() - last_note > 600:
+            print(f"predict: waiting for {len(missing)} of {world_size} processes to finish writing", flush=True)
+            last_note = time.monotonic()
+        time.sleep(1.0)
+    rows = sorted((row for path in paths for row in torch.load(path, weights_only=False)), key=lambda row: row[0])
+    if [row[0] for row in rows] != list(range(len(graphs))):
+        raise RuntimeError("the processes did not predict every graph once; were the graphs the same everywhere?")
+    labels = zip(*(_graph_values(graphs, name) for name in ("section_label", "timepoint_label",
+                                                             "condition_label")))
+    meta = dict(format=FORMAT, n_graphs=len(graphs), world_size=world_size, **details,
+                graphs=[dict(section_label=s, timepoint_label=t, condition_label=c, n_cells=n, n_grid=m,
+                             ids_dtype=d)
+                        for (s, t, c), (_, n, m, d) in zip(labels, rows)])
+    tmp = os.path.join(out, f"{META_FILE}.tmp{os.getpid()}")
+    torch.save(meta, tmp)
+    os.replace(tmp, os.path.join(out, META_FILE))
+    for path in paths:
+        _remove(path)
 
 
 def read_predictions(out, fields=None, sections=None):
@@ -418,12 +522,15 @@ def read_predictions(out, fields=None, sections=None):
         out: The folder given to ``predict``.
         fields: The optional entries to read, among those written (None: all written ones).
             ``all_labels``, ``label_list``, ``cell_types`` and ``section_ids`` are always read.
-        sections: None, or section labels (``all_sections`` values) to read; the other
-            graphs are skipped, so only the requested cells are held in memory.
+        sections: None, or a section label or a list of them (``all_sections`` values);
+            only the graphs of these sections are read, so only their cells are held in
+            memory. For ``cell_cell_interactions`` pass the same graphs, e.g.
+            ``graphs.subset(graphs.index.section_label.isin(sections))`` for a DiskGraphs.
 
     Returns:
         The dict of ``predict`` for the graphs read, in graph order; for all sections and
-        fields it equals what ``predict`` returns in memory.
+        fields it equals what ``predict`` returns in memory, except that cell ids that were
+        Python objects other than str come back as str, and missing ids (None) as NaN.
     """
     pa, pq = _pyarrow()
     out = os.fspath(out)
@@ -438,16 +545,26 @@ def read_predictions(out, fields=None, sections=None):
     missing = [f for f in wanted if f not in written]
     if missing:
         raise ValueError(f"field(s) {missing} were not written to {out}; written: {written}")
+    world_size = meta["world_size"]
     kinds = ["cells"] + (["grid"] if meta["grid"] else [])
-    shards = {kind: [_shard_path(out, kind, r, meta["world_size"]) for r in range(meta["world_size"])]
-              for kind in kinds}
-    absent = [p for paths in shards.values() for p in paths if not os.path.exists(p)]
+    parts = {kind: [_shard_path(out, kind, r, world_size) for r in range(world_size)] for kind in kinds}
+    absent = [path for paths in parts.values() for path in paths if not os.path.exists(path)]
     if absent:
         raise FileNotFoundError(f"missing prediction file(s) {absent}")
 
     graph_rows = meta["graphs"]
+    if sections is not None:
+        sections = [sections] if isinstance(sections, (str, bytes)) or not isinstance(sections, Iterable) \
+            else list(sections)
+        try:
+            lookup = set(sections)
+        except TypeError:   # unhashable labels
+            lookup = None
     selected = [g for g, row in enumerate(graph_rows)
-                if sections is None or any(_same_label(row["section_label"], s) for s in sections)]
+                if sections is None or (_in_lookup(row["section_label"], lookup) if lookup is not None
+                                        else any(_same_label(row["section_label"], s) for s in sections))]
+    if not selected:
+        raise ValueError(f"no graph of {out} belongs to the sections {sections}")
     wanted_set = set(wanted)
     columns = {"cells": ["graph", "label"], "grid": ["graph"]}
     top_k = meta["top_k"]
@@ -466,15 +583,15 @@ def read_predictions(out, fields=None, sections=None):
         columns["grid"].append("embedding")
     need_grid = meta["grid"] and len(columns["grid"]) > 1
 
-    tables = {kind: _row_groups(pq, shards[kind], set(selected), columns[kind])
-              for kind in (["cells", "grid"] if need_grid else ["cells"])}
+    readers = {kind: _PartReader(pq, parts[kind], selected, world_size, columns[kind])
+               for kind in (["cells", "grid"] if need_grid else ["cells"])}
     n_types = len(meta["cell_types"])
     pieces = []
     for g in selected:
         row = graph_rows[g]
         piece = {"n_cells": row["n_cells"], "n_grid": row["n_grid"],
                  "labels": (row["section_label"], row["timepoint_label"], row["condition_label"])}
-        cells = tables["cells"].get(g)
+        cells = readers["cells"].graph(g)
         n = row["n_cells"]
         piece["all_labels"] = np.array(_column(cells, "label", np.int64))
         if "all_positions" in wanted_set:
@@ -485,7 +602,7 @@ def read_predictions(out, fields=None, sections=None):
             else:
                 k = min(int(top_k), n_types)
                 indices = _matrix(cells, "top_types", n, k, np.int32).astype(np.int64).ravel()
-                values = _matrix(cells, "top_probs", n, k).ravel()
+                values = _matrix(cells, "top_probs", n, k).ravel().copy()   # sorted in place below
                 matrix = sparse.csr_matrix((values, indices, np.arange(0, n * k + 1, k)), shape=(n, n_types))
                 matrix.sort_indices()
                 piece["all_probs"] = matrix
@@ -500,15 +617,63 @@ def read_predictions(out, fields=None, sections=None):
         if "unique_cell_ids" in wanted_set:
             piece["unique_cell_ids"] = _ids(cells, row["ids_dtype"])
         if need_grid:
-            grid = tables["grid"].get(g)
+            grid = readers["grid"].graph(g)
             if "grid_positions" in wanted_set:
                 piece["grid_positions"] = _positions(grid, meta["axes"], meta["pos_dtype"])
             if "embeddings_grid" in wanted_set:
                 piece["embeddings_grid"] = _matrix(grid, "embedding", row["n_grid"], meta["hidden_size"])
         pieces.append(piece)
-    if not pieces:
-        raise ValueError(f"no graph of {out} belongs to the sections {list(sections)}")
+        del cells
     return _assemble(pieces, meta["cell_types"], top_k, wanted)
+
+
+class _PartReader:
+    """Reads the rows of one graph from the Parquet parts, one row group in memory per part.
+
+    Process ``r`` of ``w`` wrote the graphs ``r, r + w, ...`` in order, several per row group, so the
+    ``graph`` statistics of a row group give the range of positions it holds.
+    """
+
+    def __init__(self, pq, paths, selected, world_size, columns):
+        self.columns = columns
+        self.groups = {}   # position -> [(part, row group), ...]
+        self.handles = []
+        self.cache = {}    # part -> (row group, table, graph positions)
+        wanted = sorted(selected)
+        for rank, path in enumerate(paths):
+            handle = pq.ParquetFile(path)
+            self.handles.append(handle)
+            column = handle.schema_arrow.get_field_index("graph")
+            for i in range(handle.num_row_groups):
+                statistics = handle.metadata.row_group(i).column(column).statistics
+                if statistics is not None and statistics.has_min_max:
+                    low, high = int(statistics.min), int(statistics.max)
+                else:
+                    values = handle.read_row_group(i, columns=["graph"]).column("graph").to_numpy()
+                    low, high = int(values.min()), int(values.max())
+                for position in wanted[bisect.bisect_left(wanted, low):bisect.bisect_right(wanted, high)]:
+                    if position % world_size == rank:
+                        self.groups.setdefault(position, []).append((rank, i))
+
+    def graph(self, position):
+        """The rows of graph ``position`` (None when it has none)."""
+        slices = []
+        for rank, i in self.groups.get(position, []):
+            cached = self.cache.get(rank)
+            if cached is None or cached[0] != i:
+                table = self.handles[rank].read_row_group(i, columns=self.columns)
+                cached = (i, table, table.column("graph").to_numpy())
+                self.cache[rank] = cached
+            _, table, positions = cached
+            first, last = np.searchsorted(positions, position, "left"), np.searchsorted(positions, position, "right")
+            if last > first:
+                slices.append(table.slice(first, last - first))
+        if not slices:
+            return None
+        if len(slices) == 1:
+            return slices[0]
+        import pyarrow as pa
+        return pa.concat_tables(slices)
 
 
 def _same_label(label, wanted):
@@ -518,31 +683,11 @@ def _same_label(label, wanted):
         return False
 
 
-def _row_groups(pq, paths, selected, columns):
-    """{graph position: Arrow table} for the selected graphs, read row group by row group."""
-    tables = {}
-    for path in paths:
-        handle = pq.ParquetFile(path)
-        graph_column = handle.schema_arrow.get_field_index("graph")
-        for i in range(handle.num_row_groups):
-            statistics = handle.metadata.row_group(i).column(graph_column).statistics
-            if statistics is not None and statistics.has_min_max:
-                position = int(statistics.min)
-                if position not in selected:
-                    continue
-                table = handle.read_row_group(i, columns=columns)
-            else:
-                table = handle.read_row_group(i, columns=columns)
-                position = int(table.column("graph")[0].as_py())
-                if position not in selected:
-                    continue
-            tables[position] = table if position not in tables else _concat_tables([tables[position], table])
-    return tables
-
-
-def _concat_tables(tables):
-    import pyarrow as pa
-    return pa.concat_tables(tables)
+def _in_lookup(label, lookup):
+    try:
+        return label in lookup
+    except TypeError:
+        return False
 
 
 def _column(table, name, dtype):
@@ -567,16 +712,19 @@ def _matrix(table, name, n, width, dtype=np.float32):
 
 
 def _ids(table, dtype):
-    """Cell ids, stored as strings, back in their numpy dtype."""
+    """Cell ids, stored as strings (nulls for missing ids), back in their numpy dtype."""
     if table is None:
-        values = np.zeros(0, dtype=object)
-    else:
-        values = table.column("cell_id").to_numpy(zero_copy_only=False)
-    if dtype == "object" or dtype is None:
-        return values.astype(object)
+        return np.zeros(0, dtype=object if dtype in ("object", "object-as-text", None) else np.dtype(dtype))
+    column = table.column("cell_id")
+    values = column.to_numpy(zero_copy_only=False)
+    if dtype in ("object", "object-as-text") or dtype is None:
+        values = values.astype(object)
+        values[column.is_null().to_numpy(zero_copy_only=False)] = np.nan
+        return values
     if np.dtype(dtype).kind == "b":
         return values == "True"
     return values.astype(np.dtype(dtype))
+
 
 def cell_cell_interactions(predictions, graphs, return_normalized=False):
     """
@@ -587,8 +735,9 @@ def cell_cell_interactions(predictions, graphs, return_normalized=False):
     a section.
 
     Parameters:
-        predictions: Dictionary returned by predict().
-        graphs: The graphs that were passed to predict().
+        predictions: Dictionary returned by predict() or read_predictions().
+        graphs: The graphs the predictions were made on, in the same order (a ValueError is
+            raised when their number or their core cells do not match the predictions).
         return_normalized: Divide each tile's matrix by its edge count first.
 
     Returns:
@@ -596,9 +745,17 @@ def cell_cell_interactions(predictions, graphs, return_normalized=False):
     """
     n_types = len(predictions["cell_types"])
     matrices_by_section = defaultdict(list)
+    label_list = predictions["label_list"]
+    if hasattr(graphs, "__len__") and len(graphs) != len(label_list):
+        raise ValueError(f"the predictions cover {len(label_list)} graphs but {len(graphs)} graphs were given; "
+                         "pass the graphs the predictions were made on (after read_predictions(sections=...): "
+                         "graphs.subset(graphs.index.section_label.isin(sections)) for a DiskGraphs)")
 
-    for graph, labels in zip(graphs, predictions["label_list"]):
+    for graph, labels in zip(graphs, label_list):
         is_core = graph["cells"].is_core.detach().cpu().numpy().astype(bool)
+        if int(is_core.sum()) != len(labels):
+            raise ValueError(f"a graph of {graph.section_label} has {int(is_core.sum())} core cells but its "
+                             f"predictions have {len(labels)}: the graphs do not match the predictions")
         core_index = np.cumsum(is_core) - 1  # original index -> core index
         src, tgt = graph["cells", "is_close_to", "cells"].edge_index.detach().cpu().numpy()
         both_core = is_core[src] & is_core[tgt]

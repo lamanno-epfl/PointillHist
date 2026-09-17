@@ -587,9 +587,11 @@ def generate_graphs(
     save_dir : str or None
         None (default): the graphs are returned as a list held in memory. A
         folder that does not exist or is empty: the graphs are written there
-        section by section as they are built, so memory holds one section at a
-        time, and are returned as a :class:`DiskGraphs`, which loads each graph
-        (on the CPU) when it is accessed. The graphs are the same in both cases.
+        section by section as they are built, so memory holds one section (its
+        counts and all its tiles) at a time, and are returned as a
+        :class:`DiskGraphs`, which loads each graph (on the CPU) when it is
+        accessed. The graphs are the same in both cases. If building fails,
+        what was written is removed again.
 
     Returns
     -------
@@ -623,7 +625,38 @@ def generate_graphs(
     if grid_spacing >= min(tile_sides):
         raise ValueError(f"grid_spacing ({grid_spacing:.3g}) must be smaller than tile_side ({min(tile_sides):.3g})")
 
-    writer = None if save_dir is None else _GraphWriter(save_dir)
+    if save_dir is not None:
+        with _GraphWriter(save_dir) as writer:   # an error removes what was written
+            _build_graphs(spatial_paths, genes, region_key, tile_sides, overlaps, min_cells, min_dots,
+                          cell_cell_k_neighbors, cell_cell_maxdist, grid_spacing, counts_min_cell, device,
+                          coarse_grid_side, timepoint_labels, timepoint_codes, condition_labels, condition_codes,
+                          cell_types, writer)
+            if region_key is not None and not writer.region_vocabulary:
+                raise ValueError(f"no annotated cells found in column {region_key!r}")
+            return writer.close()
+    graphs, region_labels = _build_graphs(
+        spatial_paths, genes, region_key, tile_sides, overlaps, min_cells, min_dots, cell_cell_k_neighbors,
+        cell_cell_maxdist, grid_spacing, counts_min_cell, device, coarse_grid_side, timepoint_labels,
+        timepoint_codes, condition_labels, condition_codes, cell_types)
+
+    if region_key is not None:
+        region_labels = [_region_strings(labels) for labels in region_labels]
+        regions = sorted({r for as_str, annotated in region_labels for r in as_str[annotated]})
+        if not regions:
+            raise ValueError(f"no annotated cells found in column {region_key!r}")
+        for graph, (as_str, annotated) in zip(graphs, region_labels):
+            graph.cell_regions = _region_one_hot(as_str, annotated, regions).to(device)
+            graph.regions = regions
+
+    return graphs
+
+
+def _build_graphs(spatial_paths, genes, region_key, tile_sides, overlaps, min_cells, min_dots,
+                  cell_cell_k_neighbors, cell_cell_maxdist, grid_spacing, counts_min_cell, device,
+                  coarse_grid_side, timepoint_labels, timepoint_codes, condition_labels, condition_codes,
+                  cell_types, writer=None):
+    """The section loop of generate_graphs: the graphs and raw region labels of every section, or,
+    with a writer, each section's graphs written as soon as they are built (nothing returned)."""
     graphs, region_labels = [], []
     first = None   # (len(vertexes_fov), section_label) of the first graph, for the 2D/3D check
     for i, path in enumerate(tqdm.tqdm(spatial_paths, desc="Generating graphs")):
@@ -666,20 +699,5 @@ def generate_graphs(
         else:
             for j, graph in enumerate(tiles):
                 writer.add(graph, _region_strings(labels[j]) if region_key is not None else None)
-            tiles = labels = None   # only one section in memory
-
-    if writer is not None:
-        if region_key is not None and not writer.region_vocabulary:
-            raise ValueError(f"no annotated cells found in column {region_key!r}")
-        return writer.close()
-
-    if region_key is not None:
-        region_labels = [_region_strings(labels) for labels in region_labels]
-        regions = sorted({r for as_str, annotated in region_labels for r in as_str[annotated]})
-        if not regions:
-            raise ValueError(f"no annotated cells found in column {region_key!r}")
-        for graph, (as_str, annotated) in zip(graphs, region_labels):
-            graph.cell_regions = _region_one_hot(as_str, annotated, regions).to(device)
-            graph.regions = regions
-
-    return graphs
+            tiles = labels = graph = None   # only one section in memory
+    return graphs, region_labels

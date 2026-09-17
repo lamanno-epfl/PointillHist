@@ -87,7 +87,9 @@ def train_distributed(
     -------
     net, history
         On every process; ``history`` averages all the graphs of all the processes. Only rank 0
-        shows progress and writes checkpoints; run ``ph.eval.predict`` on rank 0.
+        shows progress and writes checkpoints. Afterwards, run ``ph.eval.predict`` on rank 0 to
+        get the results in memory, or ``ph.eval.predict(..., out=...)`` on every process to
+        write them to disk, each process predicting its share of the graphs.
     """
     if not (dist.is_available() and dist.is_initialized()) and int(os.environ.get("WORLD_SIZE", 1)) <= 1:
         return train(**locals())
@@ -245,6 +247,10 @@ def train_distributed(
             resident = _resident_bytes(graphs)
             capacity = torch.cuda.mem_get_info(device)[1]
             keep = resident + peak <= 0.95 * capacity
+            if isinstance(graphs, DiskGraphs):   # all ranks keep the graphs or none: they load them together
+                decision = torch.tensor([int(keep)], device=device)
+                dist.all_reduce(decision, op=dist.ReduceOp.MIN)
+                keep = bool(decision.item())
             if keep:
                 graphs = _to_device(graphs, device)
                 if main:

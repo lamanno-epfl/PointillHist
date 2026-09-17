@@ -1,6 +1,8 @@
 """Graphs kept in a folder on disk and loaded one at a time."""
 import copy
+import math
 import os
+import uuid
 
 import numpy as np
 import pandas as pd
@@ -26,16 +28,38 @@ def _tensor_bytes(graph):
 
 
 def _equal(a, b):
-    """Exact equality of two attribute values (lists of names, arrays, scalars)."""
+    """Exact equality of two attribute values: same types, dtypes and bits (-0.0 differs from 0.0)."""
     if type(a) is not type(b):
         return False
     if isinstance(a, (list, tuple)):
         return len(a) == len(b) and all(_equal(x, y) for x, y in zip(a, b))
+    if isinstance(a, dict):
+        return list(a) == list(b) and all(_equal(a[k], b[k]) for k in a)
+    if isinstance(a, float):
+        return a == b and math.copysign(1.0, a) == math.copysign(1.0, b)
+    if isinstance(a, (pd.Index, pd.Series)):
+        return a.name == b.name and _equal(a.to_numpy(), b.to_numpy()) and (
+            not isinstance(a, pd.Series) or _equal(a.index, b.index))
     if isinstance(a, np.ndarray):
-        return a.dtype == b.dtype and a.shape == b.shape and bool(np.all(a == b))
+        if a.dtype != b.dtype or a.shape != b.shape:
+            return False
+        if a.dtype == object:
+            return all(_equal(x, y) for x, y in zip(a.ravel(), b.ravel()))
+        return a.tobytes() == b.tobytes()
     if torch.is_tensor(a):
-        return a.dtype == b.dtype and a.shape == b.shape and torch.equal(a.cpu(), b.cpu())
-    return bool(a == b)
+        return (a.layout == b.layout == torch.strided and a.dtype == b.dtype and a.shape == b.shape
+                and a.device == b.device and torch.equal(_bits(a), _bits(b)))
+    try:
+        return bool(a == b)
+    except Exception:   # e.g. an object whose == is element-wise
+        return False
+
+
+def _bits(t):
+    """The raw bits of a floating tensor (so that -0.0 and 0.0 differ), the tensor itself otherwise."""
+    if t.is_floating_point():
+        return t.contiguous().view({8: torch.int64, 4: torch.int32, 2: torch.int16, 1: torch.int8}[t.element_size()])
+    return t
 
 
 def _graph_values(graphs, name):
@@ -49,11 +73,16 @@ def _graph_values(graphs, name):
 def _pack_tensor(t):
     """Lossless compact form of a tensor: int32 for int64 values that fit, CSR for sparse 2-D floats."""
     t = t.detach().cpu()
+    if t.layout != torch.strided:
+        return t   # sparse tensors are saved as they are
     if t.dtype == torch.int64 and t.numel() and t.min() >= -2**31 and t.max() < 2**31:
         return {_MARK: "int32", "values": t.to(torch.int32)}
-    if t.is_floating_point() and t.dim() == 2 and t.numel():
-        rows, cols = ((t != 0) | torch.signbit(t)).nonzero(as_tuple=True)   # -0.0 is kept explicitly
-        if 2 * rows.numel() <= t.numel() and t.shape[1] < 2**31:
+    if t.is_floating_point() and t.dim() == 2 and t.numel() and t.shape[1] < 2**31:
+        stored = t != 0
+        stored |= torch.signbit(t)   # -0.0 is kept explicitly
+        if 2 * int(stored.sum()) <= t.numel():
+            rows, cols = stored.nonzero(as_tuple=True)
+            del stored
             values = t[rows, cols]
             small = values.to(torch.int16)
             # int16 only when every value comes back bit for bit (no -0.0, NaN, fractions or overflow)
@@ -129,18 +158,17 @@ def _pack_graph(graph, shared, regions=None):
 def _unpack_graph(stores, shared):
     graph = HeteroData()
     for kind, key, items in stores:
+        # the global storage, or a node / edge storage (created even when it has no attribute)
+        target = graph._global_store if kind == "global" else graph[key]
         for name, value in items:
             if _is_packed(value):
                 if value[_MARK] == "shared":
-                    value = copy.copy(shared[name])
+                    value = copy.deepcopy(shared[name])
                 elif value[_MARK] == "region_codes":
                     value = _region_one_hot_from_codes(value["vocabulary"], value["codes"], shared["regions"])
                 else:
                     value = _unpack_tensor(value)
-            if kind == "global":
-                setattr(graph, name, value)
-            else:
-                graph[key][name] = value
+            target[name] = value
     return graph
 
 
@@ -150,20 +178,61 @@ def _atomic_save(obj, path):
     os.replace(tmp, path)
 
 
+def _folder(path):
+    """Absolute folder path (a DiskGraphs keeps working after the working directory changes)."""
+    path = os.fspath(path)
+    if not path:
+        raise ValueError("the folder path is empty")
+    return os.path.abspath(path)
+
+
 class _GraphWriter:
-    """Writes graphs into an empty folder one at a time; ``close`` writes the index last."""
+    """Writes graphs into an empty folder one at a time; ``close`` writes the index last.
+
+    Used as a context manager: when the block raises, the files written so far are removed again
+    (and the folder, if it was created here), so the same call can simply be run again.
+    """
 
     def __init__(self, path):
-        path = os.fspath(path)
+        path = _folder(path)
         if os.path.exists(path) and (not os.path.isdir(path) or os.listdir(path)):
-            raise FileExistsError(f"{path} already exists and is not an empty folder")
+            unfinished = (os.path.isdir(path) and GRAPH_DIR in os.listdir(path)
+                          and INDEX_FILE not in os.listdir(path))
+            raise FileExistsError(f"{path} already exists and is not an empty folder"
+                                  + (" (it holds an unfinished graph folder: remove it)" if unfinished else ""))
+        self.created = not os.path.exists(path)
         os.makedirs(os.path.join(path, GRAPH_DIR), exist_ok=True)
         self.path = path
+        self.token = uuid.uuid4().hex
         self.rows = []
         self.shared = {}
         self.tiles = {}
         self.region_vocabulary = set()
         self.streamed_regions = False
+        self.closed = False
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, kind, error, traceback):
+        if kind is not None and not self.closed:
+            self.abort()
+        return False
+
+    def abort(self):
+        """Remove what this writer wrote (graph files, temporary files, folders it created)."""
+        graph_dir = os.path.join(self.path, GRAPH_DIR)
+        for row in self.rows:
+            _remove(os.path.join(graph_dir, row["file"]))
+        for name in os.listdir(graph_dir) if os.path.isdir(graph_dir) else []:
+            if f".pt.tmp{os.getpid()}" in name:
+                _remove(os.path.join(graph_dir, name))
+        _remove(os.path.join(self.path, f"{INDEX_FILE}.tmp{os.getpid()}"))
+        for folder in (graph_dir, self.path) if self.created else (graph_dir,):
+            try:
+                os.rmdir(folder)
+            except OSError:
+                pass
 
     def add(self, graph, regions=None):
         """Write one graph; ``regions`` = (as_str, annotated) per cell for graphs built with a region_key."""
@@ -177,7 +246,7 @@ class _GraphWriter:
             raise ValueError("the graph already carries cell_regions / regions")
         for name in SHARED:
             if name in graph._global_store and name not in self.shared:
-                self.shared[name] = copy.copy(graph._global_store[name])
+                self.shared[name] = copy.deepcopy(graph._global_store[name])
         if regions is not None:
             self.streamed_regions = True
             self.region_vocabulary.update(regions[0][regions[1]])
@@ -185,7 +254,7 @@ class _GraphWriter:
         tile = self.tiles.get(section, 0)
         self.tiles[section] = tile + 1
         name = f"s{section:06d}_t{tile:06d}.pt"
-        _atomic_save({"format": FORMAT, "stores": _pack_graph(graph, self.shared, regions)},
+        _atomic_save({"format": FORMAT, "token": self.token, "stores": _pack_graph(graph, self.shared, regions)},
                      os.path.join(self.path, GRAPH_DIR, name))
         n_cells = int(graph["cells"].num_nodes)
         vertexes = getattr(graph, "vertexes_fov", None)
@@ -200,13 +269,20 @@ class _GraphWriter:
             if "regions" in self.shared:
                 raise ValueError("graphs with and without streamed regions cannot be mixed")
             self.shared["regions"] = sorted(self.region_vocabulary)
-            for row in self.rows:   # cell_regions is (n_cells, n_regions) float32 once loaded
-                row["nbytes"] += row["region_cells"] * len(self.shared["regions"]) * 4
-        for row in self.rows:
-            del row["region_cells"]
-        _atomic_save({"format": FORMAT, "shared": self.shared, "graphs": self.rows},
+        rows = [dict(row) for row in self.rows]
+        for row in rows:   # cell_regions is (n_cells, n_regions) float32 once loaded
+            row["nbytes"] += row.pop("region_cells") * len(self.shared.get("regions") or []) * 4
+        _atomic_save({"format": FORMAT, "token": self.token, "shared": self.shared, "graphs": rows},
                      os.path.join(self.path, INDEX_FILE))
+        self.closed = True
         return DiskGraphs(self.path)
+
+
+def _remove(path):
+    try:
+        os.remove(path)
+    except FileNotFoundError:
+        pass
 
 
 class DiskGraphs(torch.utils.data.Dataset):
@@ -218,15 +294,16 @@ class DiskGraphs(torch.utils.data.Dataset):
     ``load_model``, ``cell_cell_interactions``. Only the graphs a step needs are in memory, so host
     memory stays bounded whatever the number of graphs. ``graphs[i]`` loads graph ``i`` (on the CPU)
     as a new object each time; slices and :meth:`subset` give views on the same folder; iterating
-    loads the graphs one after the other.
+    loads the graphs one after the other. :attr:`index` describes every graph without loading it.
 
     The folder holds ``index.pt`` (the per-graph metadata of :attr:`index` and the cell types, genes
     and regions shared by all graphs) and one file per graph. The files are pickled: open only
-    folders you trust, as for ``torch.load``.
+    folders you trust, as for ``torch.load``. Two DiskGraphs cannot be joined with ``+``: build all
+    the sections with one ``generate_graphs`` call, which numbers them consistently.
     """
 
     def __init__(self, path, _index=None, _positions=None):
-        self.path = os.fspath(path)
+        self.path = _folder(path)
         if _index is None:
             index_path = os.path.join(self.path, INDEX_FILE)
             if not os.path.exists(index_path):
@@ -257,11 +334,29 @@ class DiskGraphs(torch.utils.data.Dataset):
         for position in self._positions:
             yield self._load(position)
 
+    def __add__(self, other):
+        raise TypeError("DiskGraphs cannot be joined with +: build all the sections with one generate_graphs "
+                        "call (it numbers sections, timepoints and conditions consistently)")
+
+    __radd__ = __add__
+
     def subset(self, indices):
-        """A view on the graphs at ``indices`` (positions in this sequence), in that order."""
+        """A view on the graphs at ``indices`` (positions in this sequence, in that order), or on the
+        graphs where a boolean mask of length ``len(self)`` is true (e.g. from :attr:`index`)."""
+        if isinstance(indices, (pd.Series, pd.Index)):
+            indices = indices.to_numpy()
+        elif torch.is_tensor(indices):
+            indices = indices.cpu().numpy()
+        array = np.asarray(indices)
+        if array.dtype == bool:
+            if array.shape != (len(self),):
+                raise IndexError(f"a boolean mask must have one entry per graph ({len(self)}), "
+                                 f"got shape {array.shape}")
+            indices = np.flatnonzero(array)
+        elif array.size and array.dtype.kind not in "iu":
+            raise TypeError(f"graph indices must be integers or a boolean mask, not {array.dtype}")
         positions = []
-        for i in indices:
-            i = int(i)
+        for i in np.asarray(indices).ravel().tolist() if array.ndim else [int(array)]:
             if not -len(self) <= i < len(self):
                 raise IndexError(f"graph index {i} out of range for {len(self)} graphs")
             positions.append(self._positions[i])
@@ -271,6 +366,9 @@ class DiskGraphs(torch.utils.data.Dataset):
         row = self._index["graphs"][position]
         path = os.path.join(self.path, GRAPH_DIR, row["file"])
         packed = torch.load(path, map_location="cpu", weights_only=False)
+        if packed.get("token") != self._index.get("token"):
+            raise RuntimeError(f"{path} does not belong to the folder opened as {self.path}: "
+                               "the folder was written again; open it again with load_graphs")
         return _unpack_graph(packed["stores"], self._index["shared"])
 
     # -- metadata -------------------------------------------------------------------
@@ -295,15 +393,15 @@ class DiskGraphs(torch.utils.data.Dataset):
 
     @property
     def cell_types(self):
-        return copy.copy(self._index["shared"].get("cell_types"))
+        return copy.deepcopy(self._index["shared"].get("cell_types"))
 
     @property
     def genes(self):
-        return copy.copy(self._index["shared"].get("genes"))
+        return copy.deepcopy(self._index["shared"].get("genes"))
 
     @property
     def regions(self):
-        return copy.copy(self._index["shared"].get("regions"))
+        return copy.deepcopy(self._index["shared"].get("regions"))
 
     def __repr__(self):
         return (f"DiskGraphs({self.path!r}, {len(self)} graphs, "
@@ -316,12 +414,13 @@ def save_graphs(graphs, path):
     which must not exist or be empty, and return them as a :class:`DiskGraphs`.
 
     Graphs are written one at a time. Tensors are stored losslessly in a compact form (sparse
-    counts, 32-bit indices) and are loaded back on the CPU.
+    counts, 32-bit indices) and are loaded back on the CPU. If writing fails, the files written so
+    far are removed again.
     """
-    writer = _GraphWriter(path)
-    for graph in graphs:
-        writer.add(graph)
-    return writer.close()
+    with _GraphWriter(path) as writer:
+        for graph in graphs:
+            writer.add(graph)
+        return writer.close()
 
 
 def load_graphs(path):
