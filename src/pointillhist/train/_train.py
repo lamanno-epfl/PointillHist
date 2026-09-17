@@ -144,7 +144,7 @@ class _Prefetcher:
     """Loads one epoch's graphs of a DiskGraphs in a background thread, up to ``depth`` graphs ahead.
 
     The batches are listed up front, which draws the shuffle exactly as iterating the loader does,
-    so training gives the same results with and without it.
+    so training sees the same graphs in the same order with and without it.
     """
 
     def __init__(self, graphs, data_loader, depth):
@@ -162,11 +162,26 @@ class _Prefetcher:
             raise RuntimeError(f"graph {position} was loaded where graph {int(i)} was expected")
         return item
 
+    def epoch(self):
+        """The batches of the epoch; the loading thread is stopped when the loop over them ends,
+        normally or through an exception (the loop releases this generator as it unwinds)."""
+        try:
+            yield from self.batches
+        finally:
+            self.close()
+
     def close(self):
         self._state["stop"].set()
-        while not self._state["queue"].empty():
-            self._state["queue"].get_nowait()
+        self._drain()   # wakes the thread if it waits to put a graph
         self._thread.join()
+        self._drain()   # a graph it put meanwhile
+
+    def _drain(self):
+        while True:
+            try:
+                self._state["queue"].get_nowait()
+            except queue.Empty:
+                return
 
     def __del__(self):   # an exception left the epoch: stop the thread
         state = getattr(self, "_state", None)
@@ -364,8 +379,11 @@ def train(
     prefetch : int
         With a DiskGraphs read from disk for each step, load this many upcoming
         graphs in a background thread while the device works on the current
-        ones (0, the default: load each graph when its step starts). The
-        results are the same; host memory holds up to ``prefetch + 2`` graphs.
+        ones (0, the default: load each graph when its step starts). Training
+        sees the same graphs in the same order, so the results agree up to
+        floating-point rounding (the thread changes where memory is allocated,
+        which can move the last bits); host memory holds up to ``prefetch + 2``
+        graphs.
 
     Returns
     -------
@@ -432,7 +450,7 @@ def train(
             epoch, num_epochs, lambda_density, lambda_density_min, lambda_density_warmup, lambda_density_decay)
 
         loader = _prefetcher(graphs, data_loader, keep, prefetch)
-        for batch_indices in data_loader if loader is None else loader.batches:
+        for batch_indices in data_loader if loader is None else loader.epoch():
             optimizer.zero_grad()
             batch_loss = 0.0
 
@@ -499,8 +517,6 @@ def train(
                 lam_anat=f"{lambda_anatomy:.4f}",
             )
 
-        if loader is not None:
-            loader.close()
         scheduler.step()
         if device.type == 'cuda':
             torch.cuda.empty_cache()

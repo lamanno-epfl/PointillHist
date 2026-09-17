@@ -180,7 +180,7 @@ def train_distributed(
             epoch, num_epochs, lambda_density, lambda_density_min, lambda_density_warmup, lambda_density_decay)
 
         loader = _prefetcher(graphs, data_loader, keep, prefetch)
-        for batch_indices in data_loader if loader is None else loader.batches:
+        for batch_indices in data_loader if loader is None else loader.epoch():
             optimizer.zero_grad()
             batch_loss = 0.0
 
@@ -243,8 +243,6 @@ def train_distributed(
                 lam_anat=f"{lambda_anatomy:.4f}",
             )
 
-        if loader is not None:
-            loader.close()
         scheduler.step()
         if device.type == 'cuda':
             torch.cuda.empty_cache()

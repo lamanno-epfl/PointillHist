@@ -2,11 +2,12 @@ import itertools
 import math
 import os
 import pickle
-import shutil
+import queue
+import signal
 import subprocess
 import sys
 import tempfile
-import time
+import threading
 import warnings
 
 import anndata as ad
@@ -18,6 +19,7 @@ from scipy.sparse import issparse
 from sklearn.neighbors import KDTree
 from torch_geometric.nn import SimpleConv
 
+from . import _graph_worker
 from ._reference import load_reference
 from ._store import _GraphWriter
 from ._topology import (
@@ -600,9 +602,13 @@ def generate_graphs(
         accessed. The graphs are the same in both cases. If building fails,
         what was written is removed again.
     n_workers : int
-        With ``save_dir``, the number of sections built at the same time,
-        each in its own Python process (on the CPU, so memory holds up to
-        ``n_workers`` sections); the graphs are the same as with 1 (default).
+        With ``save_dir``, the number of sections built at the same time, by
+        as many Python worker processes (on the CPU); the graphs, warnings and
+        errors are the same as with 1 (default). Each worker first imports
+        pointillhist (several seconds, about 1 GB of memory), then holds one
+        section at a time, so it pays off when sections take longer than
+        that to build. The threads of this process
+        (``torch.get_num_threads()``) are shared out among the workers.
 
     Returns
     -------
@@ -765,53 +771,166 @@ def _write_section(folder, token, shared, i, path, threads, section):
                 rows=writer.rows, region_vocabulary=writer.region_vocabulary, streamed=writer.streamed_regions)
 
 
-def _build_graphs_parallel(spatial_paths, settings, writer, n_workers):
-    """_build_graphs with a writer, ``n_workers`` sections at a time, each in its own Python process."""
-    shared = {"cell_types": settings["cell_types"], "genes": settings["genes"]}
-    writer.owns_all = True   # an error removes every graph file, whichever process wrote it
-    threads = max(1, (os.cpu_count() or 1) // n_workers)
-    env = dict(os.environ, PYTHONPATH=os.pathsep.join(p or os.getcwd() for p in sys.path))
-    env.setdefault("OMP_NUM_THREADS", str(threads))
-    module = __name__.rsplit(".", 1)[0] + "._graph_worker"
-    scratch = tempfile.mkdtemp(prefix="pointillhist_sections_")
-    results = [None] * len(spatial_paths)
-    pending, running = list(range(len(spatial_paths))), {}
-    bar = tqdm.tqdm(total=len(spatial_paths), desc="Generating graphs")
+class _RemoteTraceback(Exception):
+    """The traceback of an error raised in a worker process (set as the ``__cause__`` of the error)."""
+
+    def __str__(self):
+        return "\n\n" + self.args[0]
+
+
+def _read_replies(stream, worker, replies):
+    """Put every reply a worker process writes, then (worker, None) when it ends, into ``replies``."""
     try:
-        while pending or running:
-            while pending and len(running) < n_workers:
-                i = pending.pop(0)
-                task, result = os.path.join(scratch, f"task{i}.pkl"), os.path.join(scratch, f"result{i}.pkl")
-                section = dict(_section_settings(settings, i), device="cpu")
-                with open(task, "wb") as handle:
-                    pickle.dump(dict(folder=writer.path, token=writer.token, shared=shared, i=i,
-                                     path=spatial_paths[i], threads=threads, section=section), handle)
-                running[i] = (subprocess.Popen([sys.executable, "-m", module, task, result], env=env), result)
-            finished = [i for i, (process, _) in running.items() if process.poll() is not None]
-            if not finished:
-                time.sleep(0.1)
-            for i in finished:
-                process, result = running.pop(i)
-                if not os.path.exists(result):
-                    raise RuntimeError(f"the process building {spatial_paths[i]} stopped with exit code "
-                                       f"{process.returncode}")
-                with open(result, "rb") as handle:
-                    outcome = pickle.load(handle)
-                if "error" in outcome:
-                    sys.stderr.write(f"building {spatial_paths[i]} failed:\n{outcome['traceback']}")
-                    raise outcome["error"]
-                results[i] = outcome
-                bar.update(1)
+        while True:
+            message = _graph_worker.read_message(stream)
+            replies.put((worker, message))
+            if message is None:
+                return
     except BaseException:
-        for process, _ in running.values():
-            process.terminate()
-        for process, _ in running.values():
-            process.wait()
-        raise
+        replies.put((worker, None))
+
+
+def _reemit(recorded):
+    """Emit the warnings a worker recorded while building a section as if they were raised here (the
+    filters of this process apply). Each section is shown afresh, as when building in this process,
+    where the filter changes made by pandas and scikit-learn reset "once per place" between sections."""
+    registry = {}
+    for category, category_name, message, filename, lineno, module in recorded:
+        try:
+            category = pickle.loads(category)
+        except Exception:
+            category = None
+        if not (isinstance(category, type) and issubclass(category, Warning)):
+            category, message = UserWarning, f"{category_name}: {message}"
+        warnings.warn_explicit(message, category, filename, lineno, module=module, registry=registry)
+
+
+def _signal_name(number):
+    try:
+        return signal.Signals(number).name
+    except ValueError:
+        return "unknown signal"
+
+
+def _worker_error(reply, path, process, log):
+    """The exception to raise for a section whose worker failed (``reply``) or ended without a reply (None)."""
+    if reply is None:
+        code = process.wait()
+        how = (f"was killed by signal {-code} ({_signal_name(-code)}; SIGKILL often means out of memory)"
+               if code < 0 else f"ended with exit code {code}")
+        log.seek(0)
+        output = log.read().decode(errors="replace").strip()
+        return RuntimeError(f"the process building {path} {how}"
+                            + (f"; its last output:\n{output[-4000:]}" if output else ""))
+    error = None
+    if reply["error"] is not None:
+        try:
+            error = pickle.loads(reply["error"])
+        except Exception:
+            pass
+    if not isinstance(error, BaseException):
+        error = RuntimeError(f"building {path} failed: {reply['error_text']}")
+    error.__cause__ = _RemoteTraceback(reply["traceback"])
+    return error
+
+
+def _build_graphs_parallel(spatial_paths, settings, writer, n_workers):
+    """_build_graphs with a writer, run by ``n_workers`` worker processes (_graph_worker) that build one
+    section at a time each. Replies are taken in section order, so warnings, errors and the 2D/3D check
+    come out as with _build_graphs."""
+    if not sys.executable:
+        raise RuntimeError("n_workers > 1 starts Python processes, but sys.executable is not set")
+    spatial_paths = list(spatial_paths)   # by position, as the other per-section settings
+    n_sections = len(spatial_paths)
+    n_workers = min(n_workers, n_sections)
+    shared = {"cell_types": settings["cell_types"], "genes": settings["genes"]}
+    threads = max(1, torch.get_num_threads() // n_workers)   # the CPUs this process uses, shared out
+    parts = __name__.split(".")
+    root = os.path.abspath(__file__)
+    for _ in parts:   # the folder holding the package, which the workers import
+        root = os.path.dirname(root)
+    search = [root] + [os.path.abspath(p) for p in sys.path if isinstance(p, str)]
+    env = dict(os.environ, PYTHONPATH=os.pathsep.join(dict.fromkeys(search)), OMP_NUM_THREADS=str(threads),
+               PYTHONWARNINGS="ignore")   # warnings raised while building are recorded and emitted here
+    command = [sys.executable, os.path.join(os.path.dirname(os.path.abspath(__file__)), "_graph_worker.py"),
+               root, ".".join(parts[:-2])]
+    writer.owns_all = True   # an error removes every graph file, whichever process wrote it
+    replies = queue.Queue()
+    processes, logs, readers = [], [], []
+    busy, results = {}, {}   # worker -> section it builds; section -> (worker, reply or None if it ended)
+    handed, done, first, stop = 0, 0, None, False
+
+    def hand_out(worker):
+        nonlocal handed
+        section = dict(_section_settings(settings, handed), device="cpu")
+        task = pickle.dumps(dict(folder=writer.path, token=writer.token, shared=shared, i=handed,
+                                 path=spatial_paths[handed], threads=threads, section=section))
+        busy[worker] = handed
+        handed += 1
+        try:
+            _graph_worker.write_message(processes[worker].stdin, task)
+        except OSError:   # the worker has ended, which its reader reports
+            pass
+
+    bar = tqdm.tqdm(total=n_sections, desc="Generating graphs")
+    try:
+        for worker in range(n_workers):
+            logs.append(tempfile.TemporaryFile())   # its output, shown if it ends unexpectedly
+            processes.append(subprocess.Popen(command, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                                              stderr=logs[-1], env=env))
+            readers.append(threading.Thread(target=_read_replies, daemon=True,
+                                            args=(processes[-1].stdout, worker, replies)))
+            readers[-1].start()
+        for worker in range(n_workers):
+            hand_out(worker)
+        while done < n_sections:
+            while done not in results:
+                try:
+                    worker, message = replies.get(timeout=1.0)
+                except queue.Empty:
+                    continue
+                if worker not in busy:   # an idle worker ended
+                    continue
+                reply = None
+                if message is not None:
+                    try:
+                        reply = pickle.loads(message)
+                    except Exception as error:
+                        reply = dict(error=None, error_text=f"its reply cannot be read ({error!r})",
+                                     traceback="", warnings=[])
+                results[busy.pop(worker)] = (worker, reply)
+                stop = stop or reply is None or "result" not in reply
+                if not stop and handed < n_sections:   # after a failure, later sections are not needed
+                    hand_out(worker)
+            worker, reply = results.pop(done)
+            if reply is not None:
+                _reemit(reply["warnings"])
+            if reply is None or "result" not in reply:
+                raise _worker_error(reply, spatial_paths[done], processes[worker], logs[worker])
+            outcome = reply["result"]
+            first = _check_dimensions(outcome["n_vertexes"], outcome["section_label"], first,
+                                      settings["min_cells"])
+            writer.merge(outcome["rows"], outcome["region_vocabulary"], outcome["streamed"], shared)
+            done += 1
+            bar.update(1)
     finally:
         bar.close()
-        shutil.rmtree(scratch, ignore_errors=True)
-    first = None
-    for outcome in results:   # in section order, as _build_graphs
-        first = _check_dimensions(outcome["n_vertexes"], outcome["section_label"], first, settings["min_cells"])
-        writer.merge(outcome["rows"], outcome["region_vocabulary"], outcome["streamed"], shared)
+        for process in processes:
+            try:
+                process.stdin.close()   # a worker ends at the end of its input
+            except OSError:
+                pass
+            if done < n_sections:
+                process.terminate()
+        for process in processes:
+            try:
+                process.wait(timeout=60)
+            except subprocess.TimeoutExpired:
+                process.kill()
+                process.wait()
+        for reader in readers:
+            reader.join(timeout=10)
+        for process in processes:
+            process.stdout.close()
+        for log in logs:
+            log.close()

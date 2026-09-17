@@ -142,11 +142,13 @@ result = ph.eval.read_predictions("work/predictions", sections=["section_1.h5ad"
   opens it again later, and `ph.pp.save_graphs(graphs, folder)` writes an existing list.
   Building the graphs holds one section at a time (its counts and all its tiles), so a
   section too large for memory on its own has to be split into several files first;
-  `n_workers=` builds that many sections at a time, each in its own process.
+  `n_workers=` builds that many sections at a time in as many worker processes (each takes
+  about 1 GB and a few seconds to start, plus the section it builds).
 - Training holds one batch of graphs. The dispersions and distance scalers are estimated
   before training from at most 1000 randomly chosen graphs of a `DiskGraphs`;
   `setup_graphs=None` uses all of them, still one at a time. `prefetch=` loads that many
-  upcoming graphs in a background thread while the GPU works, with the same results.
+  upcoming graphs in a background thread while the GPU works; training sees the same graphs
+  in the same order.
 - `predict(..., out=)` writes one row per cell to the Parquet dataset `work/predictions/cells`
   (predicted type, the five largest probabilities, position, cell id, section, timepoint,
   condition), which `pandas.read_parquet` reads directly; `fields=` adds the logits,
@@ -162,9 +164,21 @@ process, writes one part per GPU; process 0 returns once the whole output is wri
 [`examples/train_large.py`](examples/train_large.py) does this.
 
 With graphs on disk a process holds the network, one batch of graphs and the outputs of one
-graph. On the 5.5 M cells of 19 EEL sections of the human embryonic brain (437 genes,
-435 types; graphs of 21 GB in memory), one epoch and the prediction peaked at 3 GB of host
-memory, against 71 GB with the graphs in a list.
+graph, so host memory stays the same as the dataset grows. Measured on one A100 (80 GB) with
+the 19 EEL sections of the human embryonic brain (437 genes, 435 types, 310 tiles), and with
+10 and 18 copies of them, for the setup, one epoch (`batch_size=2`, `prefetch=2`) and
+`predict(..., out=)`:
+
+| Cells | Graphs | Graphs in memory would take | Peak host memory | Peak GPU memory | Setup + epoch | Predict |
+|---|---|---|---|---|---|---|
+| 5.5 M | list | 21 GB | 53 GB | 37 GB | 104 s | 37 s |
+| 5.5 M | on disk | 21 GB | 3.0 GB | 37 GB | 92 s | 33 s |
+| 55 M | on disk | 214 GB | 3.1 GB | 40 GB | 612 s | 322 s |
+| 99 M | on disk | 385 GB | 3.1 GB | 42 GB | 1038 s | 584 s |
+
+Cells are counted once (tile overlaps aside); the predictions of the 99 M cells take 4.5 GB
+on disk. Building the 19 sections' graphs (3.6 GB on disk) took 256 s in one process with 8
+threads, and 58 s with `n_workers=8` and 8 threads per worker.
 
 ## Citation
 

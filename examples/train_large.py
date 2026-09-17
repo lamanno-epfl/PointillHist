@@ -7,11 +7,12 @@ python on one GPU or with torchrun on several GPUs of a node:
     python examples/train_large.py train [work_folder]                        # one GPU
     torchrun --nproc_per_node=4 examples/train_large.py train [work_folder]   # four GPUs
 
-Host memory stays at a few GB whatever the size of the dataset: generate_graphs writes the graphs
-section by section, training reads one batch of graphs at a time, and predict writes each graph's
-results to Parquet (``pip install "pointillhist[parquet]"``). Keep the work folder on a local
-disk, or in /dev/shm: training reads the graph files at every step. The predictions folder must
-not exist yet when ``train`` starts.
+Host memory does not grow with the size of the dataset: generate_graphs writes the graphs section
+by section (``n_workers`` processes of about 1 GB each, plus one section each), training reads one
+batch of graphs at a time, and predict writes each graph's results to Parquet
+(``pip install "pointillhist[parquet]"``). Keep the work folder on a local disk, or in /dev/shm:
+training reads the graph files at every step. The predictions folder must not exist yet when
+``train`` starts.
 
 ``--demo`` uses the skin tables of examples/data/skin, cut into 12 small tiles, and trains for 30
 epochs: ``python examples/train_large.py --demo`` runs both steps in a new temporary folder (about

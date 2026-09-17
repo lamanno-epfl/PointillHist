@@ -1,6 +1,7 @@
 """Graphs kept in a folder on disk and loaded one at a time."""
 import copy
 import math
+import operator
 import os
 import uuid
 
@@ -34,12 +35,21 @@ def _equal(a, b):
     if isinstance(a, (list, tuple)):
         return len(a) == len(b) and all(_equal(x, y) for x, y in zip(a, b))
     if isinstance(a, dict):
-        return list(a) == list(b) and all(_equal(a[k], b[k]) for k in a)
+        return _equal(list(a), list(b)) and all(_equal(a[k], b[k]) for k in a)
     if isinstance(a, float):
         return a == b and math.copysign(1.0, a) == math.copysign(1.0, b)
+    if isinstance(a, complex):
+        return _equal(a.real, b.real) and _equal(a.imag, b.imag)
+    if isinstance(a, np.generic):
+        return a.dtype == b.dtype and a.tobytes() == b.tobytes()
     if isinstance(a, (pd.Index, pd.Series)):
-        return a.name == b.name and _equal(a.to_numpy(), b.to_numpy()) and (
-            not isinstance(a, pd.Series) or _equal(a.index, b.index))
+        if isinstance(a.dtype, pd.CategoricalDtype) and not (   # == ignores the order of unordered categories
+                isinstance(b.dtype, pd.CategoricalDtype) and _equal(a.dtype.categories, b.dtype.categories)):
+            return False
+        return (a.dtype == b.dtype and _equal(list(a.names) if isinstance(a, pd.Index) else a.name,
+                                              list(b.names) if isinstance(b, pd.Index) else b.name)
+                and _equal(a.to_numpy(), b.to_numpy())
+                and (not isinstance(a, pd.Series) or _equal(a.index, b.index)))
     if isinstance(a, np.ndarray):
         if a.dtype != b.dtype or a.shape != b.shape:
             return False
@@ -48,7 +58,8 @@ def _equal(a, b):
         return a.tobytes() == b.tobytes()
     if torch.is_tensor(a):
         return (a.layout == b.layout == torch.strided and a.dtype == b.dtype and a.shape == b.shape
-                and a.device == b.device and torch.equal(_bits(a), _bits(b)))
+                and a.device == b.device and a.requires_grad == b.requires_grad
+                and torch.equal(_bits(a), _bits(b)))
     try:
         return bool(a == b)
     except Exception:   # e.g. an object whose == is element-wise
@@ -56,10 +67,17 @@ def _equal(a, b):
 
 
 def _bits(t):
-    """The raw bits of a floating tensor (so that -0.0 and 0.0 differ), the tensor itself otherwise."""
+    """The raw bits of a floating or complex tensor (so that -0.0 and 0.0 differ), the tensor itself otherwise."""
+    t = t.detach()
+    if t.is_complex():
+        t = torch.view_as_real(t.resolve_conj().resolve_neg())
     if t.is_floating_point():
         return t.contiguous().view({8: torch.int64, 4: torch.int32, 2: torch.int16, 1: torch.int8}[t.element_size()])
     return t
+
+
+#: floating dtypes stored as CSR when sparse (float8 types lack the comparisons it needs)
+_CSR_DTYPES = (torch.float16, torch.bfloat16, torch.float32, torch.float64)
 
 
 def _graph_values(graphs, name):
@@ -72,12 +90,14 @@ def _graph_values(graphs, name):
 # ---------------------------------------------------------------- tensors
 def _pack_tensor(t):
     """Lossless compact form of a tensor: int32 for int64 values that fit, CSR for sparse 2-D floats."""
-    t = t.detach().cpu()
+    if t.requires_grad:
+        return {_MARK: "requires_grad", "value": _pack_tensor(t.detach())}
+    t = t.cpu()
     if t.layout != torch.strided:
         return t   # sparse tensors are saved as they are
     if t.dtype == torch.int64 and t.numel() and t.min() >= -2**31 and t.max() < 2**31:
         return {_MARK: "int32", "values": t.to(torch.int32)}
-    if t.is_floating_point() and t.dim() == 2 and t.numel() and t.shape[1] < 2**31:
+    if t.dtype in _CSR_DTYPES and t.dim() == 2 and t.numel() and t.shape[1] < 2**31:
         stored = t != 0
         stored |= torch.signbit(t)   # -0.0 is kept explicitly
         if 2 * int(stored.sum()) <= t.numel():
@@ -97,6 +117,9 @@ def _pack_tensor(t):
 
 def _unpack_tensor(packed):
     kind = packed[_MARK]
+    if kind == "requires_grad":
+        value = packed["value"]
+        return (_unpack_tensor(value) if _is_packed(value) else value).requires_grad_()
     if kind == "int32":
         return packed["values"].to(torch.int64)
     if kind == "csr":
@@ -131,12 +154,13 @@ def _region_one_hot_from_codes(vocabulary, codes, regions):
 
 
 def _pack_graph(graph, shared, regions=None):
-    """Store order and attribute order of ``graph`` with packed tensors and markers for shared values.
+    """Store order and attribute order of ``graph`` with packed tensors and markers for shared values,
+    and the names of the values replaced by a marker.
 
     ``regions`` = (as_str, annotated) adds ``cell_regions`` / ``regions`` as generate_graphs does
     at the end, resolved against the folder's region list when the graph is loaded.
     """
-    stores = []
+    stores, marked = [], []
     for store in graph.stores:
         key = getattr(store, "_key", None)
         kind = "global" if key is None else ("edge" if isinstance(key, tuple) else "node")
@@ -144,6 +168,7 @@ def _pack_graph(graph, shared, regions=None):
         for name, value in store.items():
             if kind == "global" and name in shared and _equal(value, shared[name]):
                 value = {_MARK: "shared"}
+                marked.append(name)
             elif torch.is_tensor(value):
                 value = _pack_tensor(value)
             items.append((name, value))
@@ -151,8 +176,9 @@ def _pack_graph(graph, shared, regions=None):
             vocabulary, codes = _region_codes(*regions)
             items.append(("cell_regions", {_MARK: "region_codes", "vocabulary": vocabulary, "codes": codes}))
             items.append(("regions", {_MARK: "shared"}))
+            marked.append("regions")
         stores.append((kind, key, items))
-    return stores
+    return stores, tuple(marked)
 
 
 def _unpack_graph(stores, shared):
@@ -179,11 +205,12 @@ def _atomic_save(obj, path):
 
 
 def _folder(path):
-    """Absolute folder path (a DiskGraphs keeps working after the working directory changes)."""
+    """Absolute folder path (a DiskGraphs keeps working after the working directory changes), not
+    normalised, so that '..' after a symbolic link is resolved by the operating system."""
     path = os.fspath(path)
     if not path:
         raise ValueError("the folder path is empty")
-    return os.path.abspath(path)
+    return path if os.path.isabs(path) else os.path.join(os.getcwd(), path)
 
 
 class _GraphWriter:
@@ -277,16 +304,17 @@ class _GraphWriter:
             self.region_vocabulary.update(regions[0][regions[1]])
         section = int(graph.section)
         tile = self.tiles.get(section, 0)
-        self.tiles[section] = tile + 1
         name = f"s{section:06d}_t{tile:06d}.pt"
-        _atomic_save({"format": FORMAT, "token": self.token, "stores": _pack_graph(graph, self.shared, regions)},
-                     os.path.join(self.path, GRAPH_DIR, name))
         n_cells = int(graph["cells"].num_nodes)
         vertexes = getattr(graph, "vertexes_fov", None)
         row = {attr: getattr(graph, attr) for attr in REQUIRED if attr not in SHARED}
+        stores, marked = _pack_graph(graph, self.shared, regions)
         row.update(file=name, n_cells=n_cells, n_core_cells=int(graph["cells"].is_core.sum()),
                    nbytes=_tensor_bytes(graph), ndim=None if vertexes is None else len(vertexes) // 2,
-                   region_cells=n_cells if regions is not None else 0)
+                   shared_names=marked, region_cells=n_cells if regions is not None else 0)
+        _atomic_save({"format": FORMAT, "token": self.token, "stores": stores},
+                     os.path.join(self.path, GRAPH_DIR, name))
+        self.tiles[section] = tile + 1
         self.rows.append(row)
 
     def close(self):
@@ -295,8 +323,10 @@ class _GraphWriter:
                 raise ValueError("graphs with and without streamed regions cannot be mixed")
             self.shared["regions"] = sorted(self.region_vocabulary)
         rows = [dict(row) for row in self.rows]
+        regions = self.shared.get("regions")
+        n_regions = 0 if regions is None else len(regions)
         for row in rows:   # cell_regions is (n_cells, n_regions) float32 once loaded
-            row["nbytes"] += row.pop("region_cells") * len(self.shared.get("regions") or []) * 4
+            row["nbytes"] += row.pop("region_cells") * n_regions * 4
         _atomic_save({"format": FORMAT, "token": self.token, "shared": self.shared, "graphs": rows},
                      os.path.join(self.path, INDEX_FILE))
         self.closed = True
@@ -315,14 +345,15 @@ class DiskGraphs(torch.utils.data.Dataset):
     Graphs kept in a folder on disk, loaded one at a time when accessed.
 
     Made by ``generate_graphs(..., save_dir=...)``, :func:`save_graphs` or :func:`load_graphs`, and
-    accepted wherever a list of graphs is: ``networks``, ``train``, ``train_distributed``, ``predict``,
-    ``load_model``, ``cell_cell_interactions``. Only the graphs a step needs are in memory, so host
-    memory stays bounded whatever the number of graphs. ``graphs[i]`` loads graph ``i`` (on the CPU)
-    as a new object each time; slices and :meth:`subset` give views on the same folder; iterating
-    loads the graphs one after the other. :attr:`index` describes every graph without loading it.
+    accepted wherever a list of graphs is: ``networks``, ``load_model``, ``setup_training``, ``train``,
+    ``train_distributed``, ``predict``, ``cell_cell_interactions`` and ``ph.pl.fovs``. Only the graphs
+    a step needs are in memory, so host memory stays bounded whatever the number of graphs.
+    ``graphs[i]`` loads graph ``i`` (on the CPU) as a new object each time; slices and :meth:`subset`
+    give views on the same folder; iterating loads the graphs one after the other. :attr:`index`
+    describes every graph without loading it.
 
     The folder holds ``index.pt`` (the per-graph metadata of :attr:`index` and the cell types, genes
-    and regions shared by all graphs) and one file per graph. The files are pickled: open only
+    and regions shared by all graphs) and one file per graph in ``graphs/``. The files are pickled: open only
     folders you trust, as for ``torch.load``. Two DiskGraphs cannot be joined with ``+``: build all
     the sections with one ``generate_graphs`` call, which numbers them consistently.
     """
@@ -348,9 +379,12 @@ class DiskGraphs(torch.utils.data.Dataset):
     def __getitem__(self, i):
         if isinstance(i, slice):
             return self.subset(range(len(self))[i])
-        if isinstance(i, bool) or not (isinstance(i, (int, np.integer)) or (torch.is_tensor(i) and i.dim() == 0)):
-            raise TypeError(f"graph index must be an integer or a slice, not {type(i).__name__}")
-        i = int(i)
+        try:
+            if isinstance(i, (bool, np.bool_)) or (torch.is_tensor(i) and i.dtype == torch.bool):
+                raise TypeError
+            i = operator.index(i)
+        except TypeError:
+            raise TypeError(f"graph index must be an integer or a slice, not {type(i).__name__}") from None
         if not -len(self) <= i < len(self):
             raise IndexError(f"graph index {i} out of range for {len(self)} graphs")
         return self._load(self._positions[i])
@@ -367,11 +401,18 @@ class DiskGraphs(torch.utils.data.Dataset):
 
     def subset(self, indices):
         """A view on the graphs at ``indices`` (positions in this sequence, in that order), or on the
-        graphs where a boolean mask of length ``len(self)`` is true (e.g. from :attr:`index`)."""
-        if isinstance(indices, (pd.Series, pd.Index)):
+        graphs where a boolean mask is true: an array of length ``len(self)``, or a boolean Series
+        whose index labels are positions (as those of :attr:`index`, in any order)."""
+        if isinstance(indices, pd.Series) and pd.api.types.is_bool_dtype(indices.dtype):
+            indices = self._series_mask(indices)
+        elif isinstance(indices, (pd.Series, pd.Index)):
             indices = indices.to_numpy()
         elif torch.is_tensor(indices):
             indices = indices.cpu().numpy()
+        elif isinstance(indices, (set, frozenset)):
+            raise TypeError("graph indices must be ordered: pass a list, not a set")
+        elif not isinstance(indices, np.ndarray) and not np.isscalar(indices):
+            indices = list(indices)   # generators, map, dict_keys, ...
         array = np.asarray(indices)
         if array.dtype == bool:
             if array.shape != (len(self),):
@@ -379,13 +420,31 @@ class DiskGraphs(torch.utils.data.Dataset):
                                  f"got shape {array.shape}")
             indices = np.flatnonzero(array)
         elif array.size and array.dtype.kind not in "iu":
-            raise TypeError(f"graph indices must be integers or a boolean mask, not {array.dtype}")
+            try:   # objects with __index__, as a list accepts them
+                if array.dtype != object or any(isinstance(i, (bool, np.bool_)) for i in array.ravel()):
+                    raise TypeError
+                indices = np.array([operator.index(i) for i in array.ravel()], dtype=np.int64)
+            except TypeError:
+                raise TypeError(f"graph indices must be integers or a boolean mask, not {array.dtype}") from None
         positions = []
         for i in np.asarray(indices).ravel().tolist() if array.ndim else [int(array)]:
             if not -len(self) <= i < len(self):
                 raise IndexError(f"graph index {i} out of range for {len(self)} graphs")
             positions.append(self._positions[i])
         return DiskGraphs(self.path, _index=self._index, _positions=positions)
+
+    def _series_mask(self, mask):
+        """A boolean Series as a mask in position order, aligned by its labels (those of :attr:`index`)."""
+        labels = mask.index
+        if len(labels) != len(self) or labels.has_duplicates or (
+                len(labels) and not (pd.api.types.is_integer_dtype(labels)
+                                     and pd.RangeIndex(len(self)).isin(labels).all())):
+            raise IndexError(f"a boolean Series must carry the labels of graphs.index (0 to {len(self) - 1}, "
+                             "in any order), one entry per graph")
+        mask = mask.reindex(pd.RangeIndex(len(self)))
+        if mask.isna().any():
+            raise ValueError("a boolean mask cannot contain missing values")
+        return mask.to_numpy(dtype=bool)
 
     def _load(self, position):
         row = self._index["graphs"][position]
@@ -403,30 +462,43 @@ class DiskGraphs(torch.utils.data.Dataset):
 
     @property
     def index(self):
-        """One row per graph: file, section, timepoint and condition codes and labels, n_cells (frames
-        included), n_core_cells, nbytes (tensor bytes once loaded) and ndim (2 or 3)."""
+        """One row per graph (a new DataFrame each time, indexed by position): file, section, timepoint
+        and condition codes and labels, n_cells (frames included), n_core_cells, nbytes (tensor bytes
+        once loaded) and ndim (2 or 3)."""
         if self._frame is None:
             columns = ["file", "section", "section_label", "timepoint", "timepoint_label", "condition",
                        "condition_label", "n_cells", "n_core_cells", "nbytes", "ndim"]
             self._frame = pd.DataFrame([self._index["graphs"][p] for p in self._positions], columns=columns)
-        return self._frame
+        return self._frame.copy()
 
     @property
     def nbytes(self):
         """Total tensor bytes of the graphs once loaded."""
         return sum(self._column("nbytes"))
 
+    def _first_value(self, name):
+        """``name`` of the first graph of this view, from the index when that graph shares it."""
+        shared = self._index["shared"]
+        if self._positions:
+            row = self._index["graphs"][self._positions[0]]
+            if name not in row.get("shared_names", tuple(shared)):
+                return getattr(self[0], name, None)
+        return copy.deepcopy(shared.get(name))
+
     @property
     def cell_types(self):
-        return copy.deepcopy(self._index["shared"].get("cell_types"))
+        """The cell types of the first graph (read from the index when it shares them)."""
+        return self._first_value("cell_types")
 
     @property
     def genes(self):
-        return copy.deepcopy(self._index["shared"].get("genes"))
+        """The genes of the first graph (read from the index when it shares them)."""
+        return self._first_value("genes")
 
     @property
     def regions(self):
-        return copy.deepcopy(self._index["shared"].get("regions"))
+        """The regions of the first graph, or None (read from the index when it shares them)."""
+        return self._first_value("regions")
 
     def __repr__(self):
         return (f"DiskGraphs({self.path!r}, {len(self)} graphs, "
