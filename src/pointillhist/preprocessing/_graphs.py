@@ -13,6 +13,7 @@ from sklearn.neighbors import KDTree
 from torch_geometric.nn import SimpleConv
 
 from ._reference import load_reference
+from ._store import _GraphWriter
 from ._topology import (
     hex_grid_by_spacing,
     build_tile_graph,
@@ -550,6 +551,7 @@ def generate_graphs(
     counts_min_cell=-1,
     coarse_grid_side=7,
     device="cpu",
+    save_dir=None,
 ):
     """Tile every spatial section into HeteroData graphs.
 
@@ -582,12 +584,19 @@ def generate_graphs(
         currently has no effect and ``cell_cell_maxdist`` is fixed at 90
         (deliberate, see CLEANUP_PLAN.md §11); on the AnnData path ``min_dots``
         is unused.
+    save_dir : str or None
+        None (default): the graphs are returned as a list held in memory. A
+        folder that does not exist or is empty: the graphs are written there
+        section by section as they are built, so memory holds one section at a
+        time, and are returned as a :class:`DiskGraphs`, which loads each graph
+        (on the CPU) when it is accessed. The graphs are the same in both cases.
 
     Returns
     -------
-    list of HeteroData, each carrying section_label, section, timepoint_label,
-    timepoint, condition_label, condition, cell_types, genes, unique_cell_ids
-    (and cell_regions, regions when ``region_key`` is given).
+    list of HeteroData (a DiskGraphs with ``save_dir``), each carrying
+    section_label, section, timepoint_label, timepoint, condition_label,
+    condition, cell_types, genes, unique_cell_ids (and cell_regions, regions
+    when ``region_key`` is given).
     """
     if len(spatial_paths) == 0:
         raise ValueError("spatial_paths is empty")
@@ -614,7 +623,9 @@ def generate_graphs(
     if grid_spacing >= min(tile_sides):
         raise ValueError(f"grid_spacing ({grid_spacing:.3g}) must be smaller than tile_side ({min(tile_sides):.3g})")
 
+    writer = None if save_dir is None else _GraphWriter(save_dir)
     graphs, region_labels = [], []
+    first = None   # (len(vertexes_fov), section_label) of the first graph, for the 2D/3D check
     for i, path in enumerate(tqdm.tqdm(spatial_paths, desc="Generating graphs")):
         if isinstance(path, (tuple, list)):
             tiles, labels = _graphs_from_tables(
@@ -634,9 +645,11 @@ def generate_graphs(
             section_label = os.path.basename(path)
         if not tiles:
             warnings.warn(f"{section_label}: no tile passed the filters (min_cells={min_cells})")
-        elif graphs and len(tiles[0].vertexes_fov) != len(graphs[0].vertexes_fov):
+        elif first is None:
+            first = (len(tiles[0].vertexes_fov), section_label)
+        elif len(tiles[0].vertexes_fov) != first[0]:
             raise ValueError(f"{section_label} is {len(tiles[0].vertexes_fov) // 2}D but "
-                             f"{graphs[0].section_label} is {len(graphs[0].vertexes_fov) // 2}D: "
+                             f"{first[1]} is {first[0] // 2}D: "
                              "2D and 3D sections cannot be mixed")
         for graph in tiles:
             graph.section_label = section_label
@@ -647,8 +660,18 @@ def generate_graphs(
             graph.condition = int(condition_codes[i])
             graph.cell_types = cell_types
             graph.genes = genes
-        graphs += tiles
-        region_labels += labels
+        if writer is None:
+            graphs += tiles
+            region_labels += labels
+        else:
+            for j, graph in enumerate(tiles):
+                writer.add(graph, _region_strings(labels[j]) if region_key is not None else None)
+            tiles = labels = None   # only one section in memory
+
+    if writer is not None:
+        if region_key is not None and not writer.region_vocabulary:
+            raise ValueError(f"no annotated cells found in column {region_key!r}")
+        return writer.close()
 
     if region_key is not None:
         region_labels = [_region_strings(labels) for labels in region_labels]
