@@ -14,6 +14,7 @@ from ._train import (
     LOSS_KEYS,
     _lambda_anatomical_schedule,
     _lambda_density_schedule,
+    _prefetcher,
     _reference,
     _resident_bytes,
     _setup_subset,
@@ -68,6 +69,7 @@ def train_distributed(
     keep_on_device="auto",
     device=None,
     setup_graphs="auto",
+    prefetch=0,
 ):
     """
     :func:`train` on several processes, one per GPU: ``torchrun --nproc_per_node=<n_gpus> script.py``.
@@ -97,6 +99,7 @@ def train_distributed(
     if device is None:
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     device = torch.device(device)
+    _prefetcher(graphs, None, True, prefetch)   # checks the value
     if device.type == "cuda":
         if device.index is None:   # modulo: a launcher may show each process only its own GPU
             local_rank = int(os.environ.get("LOCAL_RANK", torch.cuda.current_device()))
@@ -176,12 +179,14 @@ def train_distributed(
         lambda_density_eff = _lambda_density_schedule(
             epoch, num_epochs, lambda_density, lambda_density_min, lambda_density_warmup, lambda_density_decay)
 
-        for batch_indices in data_loader:
+        loader = _prefetcher(graphs, data_loader, keep, prefetch)
+        for batch_indices in data_loader if loader is None else loader.batches:
             optimizer.zero_grad()
             batch_loss = 0.0
 
             for i in batch_indices:
-                graph = graphs[i] if keep else copy.copy(graphs[i]).to(device)
+                source = graphs[i] if loader is None else loader.get(i)
+                graph = source if keep else copy.copy(source).to(device)
 
                 cell_dots, logits, *_, scale, (pi_cell, pi_lowrank) = net(graph)
 
@@ -216,7 +221,7 @@ def train_distributed(
                 for k, val in zip(LOSS_KEYS, losses):
                     epoch_sums[k] += val.detach().cpu().item()
 
-                del pi_cell, pi_lowrank, cell_dots, logits, scale, graph, losses
+                del pi_cell, pi_lowrank, cell_dots, logits, scale, graph, losses, source
 
             avg_batch_loss = batch_loss / len(batch_indices)
             avg_batch_loss.backward()
@@ -238,6 +243,8 @@ def train_distributed(
                 lam_anat=f"{lambda_anatomy:.4f}",
             )
 
+        if loader is not None:
+            loader.close()
         scheduler.step()
         if device.type == 'cuda':
             torch.cuda.empty_cache()

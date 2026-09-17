@@ -1,5 +1,7 @@
 import copy
 import os
+import queue
+import threading
 
 import numpy as np
 import pandas as pd
@@ -138,6 +140,71 @@ def _setup_subset(graphs, setup_graphs):
     return [graphs[i] for i in chosen]
 
 
+class _Prefetcher:
+    """Loads one epoch's graphs of a DiskGraphs in a background thread, up to ``depth`` graphs ahead.
+
+    The batches are listed up front, which draws the shuffle exactly as iterating the loader does,
+    so training gives the same results with and without it.
+    """
+
+    def __init__(self, graphs, data_loader, depth):
+        self.batches = list(data_loader)
+        order = [int(i) for batch in self.batches for i in batch]
+        self._state = {"stop": threading.Event(), "queue": queue.Queue(maxsize=depth)}
+        self._thread = threading.Thread(target=_prefetch, args=(graphs, order, self._state), daemon=True)
+        self._thread.start()
+
+    def get(self, i):
+        position, item = self._state["queue"].get()
+        if position is None:   # the loading thread failed
+            raise item
+        if position != int(i):
+            raise RuntimeError(f"graph {position} was loaded where graph {int(i)} was expected")
+        return item
+
+    def close(self):
+        self._state["stop"].set()
+        while not self._state["queue"].empty():
+            self._state["queue"].get_nowait()
+        self._thread.join()
+
+    def __del__(self):   # an exception left the epoch: stop the thread
+        state = getattr(self, "_state", None)
+        if state is not None:
+            state["stop"].set()
+
+
+def _prefetch(graphs, order, state):
+    items, stop = state["queue"], state["stop"]
+    try:
+        for i in order:
+            graph = graphs[i]
+            while not stop.is_set():
+                try:
+                    items.put((i, graph), timeout=0.1)
+                    break
+                except queue.Full:
+                    pass
+            if stop.is_set():
+                return
+    except BaseException as error:   # handed to the training loop
+        while not stop.is_set():
+            try:
+                items.put((None, error), timeout=0.1)
+                return
+            except queue.Full:
+                pass
+
+
+def _prefetcher(graphs, data_loader, keep, prefetch):
+    """A _Prefetcher when ``prefetch`` asks for one and the graphs are read from disk for each step."""
+    if isinstance(prefetch, (bool, np.bool_)) or not isinstance(prefetch, (int, np.integer)) or prefetch < 0:
+        raise ValueError(f"prefetch must be a non-negative integer, got {prefetch!r}")
+    if prefetch and not keep and isinstance(graphs, DiskGraphs):
+        return _Prefetcher(graphs, data_loader, int(prefetch))
+    return None
+
+
 def _reference(reference, graphs):
     """(K, G) float tensor aligned to the graphs' cell types and genes."""
     if isinstance(reference, (torch.Tensor, np.ndarray)):
@@ -249,6 +316,7 @@ def train(
     keep_on_device="auto",
     device=None,
     setup_graphs="auto",
+    prefetch=0,
 ):
     """
     Train the network, reporting a running average of each loss term per epoch.
@@ -293,6 +361,11 @@ def train(
         seed (all of them if there are fewer), a faster approximation for large
         datasets. "auto" (default): all graphs of a list, at most 1000 of a
         DiskGraphs.
+    prefetch : int
+        With a DiskGraphs read from disk for each step, load this many upcoming
+        graphs in a background thread while the device works on the current
+        ones (0, the default: load each graph when its step starts). The
+        results are the same; host memory holds up to ``prefetch + 2`` graphs.
 
     Returns
     -------
@@ -301,6 +374,7 @@ def train(
     if device is None:
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     device = torch.device(device)
+    _prefetcher(graphs, None, True, prefetch)   # checks the value
 
     reference = _reference(reference, graphs).to(device)
     priors = _type_priors(type_priors, graphs)
@@ -357,7 +431,8 @@ def train(
         lambda_density_eff = _lambda_density_schedule(
             epoch, num_epochs, lambda_density, lambda_density_min, lambda_density_warmup, lambda_density_decay)
 
-        for batch_indices in data_loader:
+        loader = _prefetcher(graphs, data_loader, keep, prefetch)
+        for batch_indices in data_loader if loader is None else loader.batches:
             optimizer.zero_grad()
             batch_loss = 0.0
 
@@ -365,7 +440,8 @@ def train(
                 # a resident graph is used in place; otherwise a shallow copy carries this step's tensors to the
                 # device while the host copy stays untouched (nothing is copied back, the device copy is freed
                 # once the step's autograd graph is released)
-                graph = graphs[i] if keep else copy.copy(graphs[i]).to(device)
+                source = graphs[i] if loader is None else loader.get(i)
+                graph = source if keep else copy.copy(source).to(device)
 
                 cell_dots, logits, *_, scale, (pi_cell, pi_lowrank) = net(graph)
 
@@ -400,7 +476,7 @@ def train(
                 for k, val in zip(LOSS_KEYS, losses):
                     epoch_sums[k] += val.detach().cpu().item()
 
-                del pi_cell, pi_lowrank, cell_dots, logits, scale, graph, losses
+                del pi_cell, pi_lowrank, cell_dots, logits, scale, graph, losses, source
 
             if len(batch_indices) > 0:
                 avg_batch_loss = batch_loss / len(batch_indices)
@@ -423,6 +499,8 @@ def train(
                 lam_anat=f"{lambda_anatomy:.4f}",
             )
 
+        if loader is not None:
+            loader.close()
         scheduler.step()
         if device.type == 'cuda':
             torch.cuda.empty_cache()
