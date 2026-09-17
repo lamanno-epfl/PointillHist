@@ -150,7 +150,7 @@ class _Prefetcher:
     def __init__(self, graphs, data_loader, depth):
         self.batches = list(data_loader)
         order = [int(i) for batch in self.batches for i in batch]
-        self._state = {"stop": threading.Event(), "queue": queue.Queue(maxsize=depth)}
+        self._state = {"stop": threading.Event(), "done": threading.Event(), "queue": queue.Queue(maxsize=depth)}
         self._thread = threading.Thread(target=_prefetch, args=(graphs, order, self._state), daemon=True)
         self._thread.start()
 
@@ -167,14 +167,26 @@ class _Prefetcher:
         normally or through an exception (the loop releases this generator as it unwinds)."""
         try:
             yield from self.batches
-        finally:
-            self.close()
+        except GeneratorExit:   # the loop was left early; its exception is on its way
+            self.close(reraise=False)
+            raise
+        self.close()
 
-    def close(self):
+    def close(self, reraise=True):
+        """Stop the loading thread and wait until it has ended (at most one graph load). A Ctrl-C meanwhile
+        does not cut the wait short; it is raised afterwards (with ``reraise``)."""
         self._state["stop"].set()
-        self._drain()   # wakes the thread if it waits to put a graph
-        self._thread.join()
+        interrupted = False
+        while True:
+            try:
+                self._drain()   # wakes the thread if it waits to put a graph
+                if self._state["done"].wait(0.1):
+                    break
+            except KeyboardInterrupt:
+                interrupted = True
         self._drain()   # a graph it put meanwhile
+        if interrupted and reraise:
+            raise KeyboardInterrupt
 
     def _drain(self):
         while True:
@@ -200,6 +212,7 @@ def _prefetch(graphs, order, state):
                     break
                 except queue.Full:
                     pass
+            graph = None   # an error loading the next graph must not keep this one alive
             if stop.is_set():
                 return
     except BaseException as error:   # handed to the training loop
@@ -209,6 +222,8 @@ def _prefetch(graphs, order, state):
                 return
             except queue.Full:
                 pass
+    finally:
+        state["done"].set()
 
 
 def _prefetcher(graphs, data_loader, keep, prefetch):

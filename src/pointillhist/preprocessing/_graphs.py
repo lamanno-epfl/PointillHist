@@ -1,3 +1,4 @@
+import importlib.machinery
 import itertools
 import math
 import os
@@ -758,7 +759,8 @@ def _build_graphs(spatial_paths, settings, writer=None):
 
 def _write_section(folder, token, shared, i, path, threads, section):
     """Build section ``i`` and write its graphs into ``folder`` (run by _graph_worker in its own process)."""
-    torch.set_num_threads(threads)
+    if torch.get_num_threads() != threads:   # set through OMP_NUM_THREADS (torch 2.4 briefly starts
+        torch.set_num_threads(threads)       # a thread per core in set_num_threads)
     tiles, labels, section_label = _section_tiles(i, path, **section)
     writer = _GraphWriter.attached(folder, token, shared)
     try:
@@ -779,15 +781,23 @@ class _RemoteTraceback(Exception):
 
 
 def _read_replies(stream, worker, replies):
-    """Put every reply a worker process writes, then (worker, None) when it ends, into ``replies``."""
+    """Put every reply a worker process writes into ``replies``, then (worker, None) when it ends, or
+    (worker, exception) when its replies cannot be read."""
     try:
         while True:
             message = _graph_worker.read_message(stream)
             replies.put((worker, message))
             if message is None:
                 return
-    except BaseException:
-        replies.put((worker, None))
+    except BaseException as error:
+        replies.put((worker, error))
+
+
+def _loaded(pickled):
+    try:
+        return pickle.loads(pickled)
+    except Exception:
+        return None
 
 
 def _reemit(recorded):
@@ -795,14 +805,18 @@ def _reemit(recorded):
     filters of this process apply). Each section is shown afresh, as when building in this process,
     where the filter changes made by pandas and scikit-learn reset "once per place" between sections."""
     registry = {}
-    for category, category_name, message, filename, lineno, module in recorded:
-        try:
-            category = pickle.loads(category)
-        except Exception:
-            category = None
-        if not (isinstance(category, type) and issubclass(category, Warning)):
-            category, message = UserWarning, f"{category_name}: {message}"
-        warnings.warn_explicit(message, category, filename, lineno, module=module, registry=registry)
+    for w in recorded:
+        message = _loaded(w["message"]) if w["message"] is not None else None
+        if not isinstance(message, Warning):
+            category = _loaded(w["category"]) if w["category"] is not None else None
+            try:
+                message = category(w["text"])
+            except Exception:
+                message = None
+            if not isinstance(message, Warning):
+                message = UserWarning(f"{w['category_name']}: {w['text']}")
+        warnings.warn_explicit(message, type(message), w["filename"], w["lineno"], module=w["module"],
+                               registry=registry)
 
 
 def _signal_name(number):
@@ -812,26 +826,67 @@ def _signal_name(number):
         return "unknown signal"
 
 
-def _worker_error(reply, path, process, log):
-    """The exception to raise for a section whose worker failed (``reply``) or ended without a reply (None)."""
+def _worker_error(reply, path, process, log, problem=None):
+    """The exception to raise for a section whose worker failed (``reply``), ended without a reply (None),
+    or sent a reply that cannot be read (``problem``)."""
     if reply is None:
-        code = process.wait()
-        how = (f"was killed by signal {-code} ({_signal_name(-code)}; SIGKILL often means out of memory)"
-               if code < 0 else f"ended with exit code {code}")
+        if problem is not None:
+            process.kill()   # its stream is out of step
+        try:
+            code = process.wait(timeout=10)
+        except subprocess.TimeoutExpired:
+            process.kill()
+            code = process.wait()
+        if problem is not None:
+            how = f"sent a reply that cannot be read ({type(problem).__name__}: {problem})"
+        elif code < 0:
+            how = f"was killed by signal {-code} ({_signal_name(-code)}; SIGKILL often means out of memory)"
+        else:
+            how = f"ended with exit code {code}"
         log.seek(0)
         output = log.read().decode(errors="replace").strip()
         return RuntimeError(f"the process building {path} {how}"
                             + (f"; its last output:\n{output[-4000:]}" if output else ""))
-    error = None
-    if reply["error"] is not None:
-        try:
-            error = pickle.loads(reply["error"])
-        except Exception:
-            pass
+    error = _loaded(reply["error"]) if reply["error"] is not None else None
     if not isinstance(error, BaseException):
         error = RuntimeError(f"building {path} failed: {reply['error_text']}")
     error.__cause__ = _RemoteTraceback(reply["traceback"])
     return error
+
+
+def _search_path():
+    """This process's module search path, with relative entries resolved as its import system resolved
+    them, and the folder holding this package first when the path alone would find another copy."""
+    path = []
+    for entry in sys.path:
+        if not isinstance(entry, str):
+            continue   # skipped by the import system too
+        found = getattr(sys.path_importer_cache.get(entry), "path", None)
+        if entry and not os.path.isabs(entry) and isinstance(found, str) and os.path.isabs(found):
+            path.append(found)   # where this process imports from, whatever the current directory
+        else:
+            path.append(os.path.abspath(entry))
+    parts = __name__.split(".")
+    root = os.path.abspath(__file__)
+    for _ in parts:
+        root = os.path.dirname(root)
+    package = sys.modules.get(parts[0])
+    try:
+        spec = importlib.machinery.PathFinder.find_spec(parts[0], path)
+    except Exception:
+        spec = None
+    if spec is None or package is None or spec.origin is None or spec.origin != getattr(package, "__file__", None):
+        path.insert(0, root)
+    return path
+
+
+def _interpreter_flags():
+    """The command-line flags of this interpreter that a worker should share (-E, -s, -X ...)."""
+    flags = getattr(subprocess, "_args_from_interpreter_flags", None)
+    try:
+        return [f for f in flags() if not f.startswith("-W")] if flags else []
+    except Exception:
+        return []
 
 
 def _build_graphs_parallel(spatial_paths, settings, writer, n_workers):
@@ -845,20 +900,23 @@ def _build_graphs_parallel(spatial_paths, settings, writer, n_workers):
     n_workers = min(n_workers, n_sections)
     shared = {"cell_types": settings["cell_types"], "genes": settings["genes"]}
     threads = max(1, torch.get_num_threads() // n_workers)   # the CPUs this process uses, shared out
-    parts = __name__.split(".")
-    root = os.path.abspath(__file__)
-    for _ in parts:   # the folder holding the package, which the workers import
-        root = os.path.dirname(root)
-    search = [root] + [os.path.abspath(p) for p in sys.path if isinstance(p, str)]
-    env = dict(os.environ, PYTHONPATH=os.pathsep.join(dict.fromkeys(search)), OMP_NUM_THREADS=str(threads),
-               PYTHONWARNINGS="ignore")   # warnings raised while building are recorded and emitted here
-    command = [sys.executable, os.path.join(os.path.dirname(os.path.abspath(__file__)), "_graph_worker.py"),
-               root, ".".join(parts[:-2])]
+    setup = pickle.dumps(dict(path=_search_path(), module=__name__.rsplit(".", 1)[0] + "._graph_worker",
+                              parent=os.getpid()))
+    env = dict(os.environ, OMP_NUM_THREADS=str(threads))
+    # warnings raised while importing are not shown (this process showed them); those raised while
+    # building are recorded and emitted here
+    command = [sys.executable, *_interpreter_flags(), "-W", "ignore", "-c", _graph_worker.BOOTSTRAP]
     writer.owns_all = True   # an error removes every graph file, whichever process wrote it
     replies = queue.Queue()
     processes, logs, readers = [], [], []
-    busy, results = {}, {}   # worker -> section it builds; section -> (worker, reply or None if it ended)
+    busy, results = {}, {}   # worker -> section it builds; section -> (worker, reply, problem)
     handed, done, first, stop = 0, 0, None, False
+
+    def send(worker, payload):
+        try:
+            _graph_worker.write_message(processes[worker].stdin, payload)
+        except OSError:   # the worker has ended, which its reader reports
+            pass
 
     def hand_out(worker):
         nonlocal handed
@@ -867,10 +925,7 @@ def _build_graphs_parallel(spatial_paths, settings, writer, n_workers):
                                  path=spatial_paths[handed], threads=threads, section=section))
         busy[worker] = handed
         handed += 1
-        try:
-            _graph_worker.write_message(processes[worker].stdin, task)
-        except OSError:   # the worker has ended, which its reader reports
-            pass
+        send(worker, task)
 
     bar = tqdm.tqdm(total=n_sections, desc="Generating graphs")
     try:
@@ -881,6 +936,7 @@ def _build_graphs_parallel(spatial_paths, settings, writer, n_workers):
             readers.append(threading.Thread(target=_read_replies, daemon=True,
                                             args=(processes[-1].stdout, worker, replies)))
             readers[-1].start()
+            send(worker, setup)
         for worker in range(n_workers):
             hand_out(worker)
         while done < n_sections:
@@ -891,22 +947,24 @@ def _build_graphs_parallel(spatial_paths, settings, writer, n_workers):
                     continue
                 if worker not in busy:   # an idle worker ended
                     continue
-                reply = None
-                if message is not None:
+                reply, problem = None, None
+                if isinstance(message, BaseException):
+                    problem = message
+                elif message is not None:
                     try:
                         reply = pickle.loads(message)
                     except Exception as error:
                         reply = dict(error=None, error_text=f"its reply cannot be read ({error!r})",
                                      traceback="", warnings=[])
-                results[busy.pop(worker)] = (worker, reply)
+                results[busy.pop(worker)] = (worker, reply, problem)
                 stop = stop or reply is None or "result" not in reply
                 if not stop and handed < n_sections:   # after a failure, later sections are not needed
                     hand_out(worker)
-            worker, reply = results.pop(done)
+            worker, reply, problem = results.pop(done)
             if reply is not None:
                 _reemit(reply["warnings"])
             if reply is None or "result" not in reply:
-                raise _worker_error(reply, spatial_paths[done], processes[worker], logs[worker])
+                raise _worker_error(reply, spatial_paths[done], processes[worker], logs[worker], problem)
             outcome = reply["result"]
             first = _check_dimensions(outcome["n_vertexes"], outcome["section_label"], first,
                                       settings["min_cells"])
@@ -920,7 +978,7 @@ def _build_graphs_parallel(spatial_paths, settings, writer, n_workers):
                 process.stdin.close()   # a worker ends at the end of its input
             except OSError:
                 pass
-            if done < n_sections:
+            if done < n_sections and process.poll() is None:
                 process.terminate()
         for process in processes:
             try:
@@ -928,9 +986,9 @@ def _build_graphs_parallel(spatial_paths, settings, writer, n_workers):
             except subprocess.TimeoutExpired:
                 process.kill()
                 process.wait()
-        for reader in readers:
+        for process, reader in zip(processes, readers):
             reader.join(timeout=10)
-        for process in processes:
-            process.stdout.close()
+            if not reader.is_alive():   # never close a stream a reader is blocked in
+                process.stdout.close()
         for log in logs:
             log.close()

@@ -3,6 +3,7 @@ import copy
 import math
 import operator
 import os
+import pickle
 import uuid
 
 import numpy as np
@@ -28,10 +29,24 @@ def _tensor_bytes(graph):
     return sum(v.numel() * v.element_size() for store in graph.stores for v in store.values() if torch.is_tensor(v))
 
 
+#: types whose == is exact once the types are the same
+_EXACT = (str, bytes, int, type(None))
+
+
+def _same_pickle(a, b):
+    try:
+        return pickle.dumps(a) == pickle.dumps(b)
+    except Exception:
+        return False
+
+
 def _equal(a, b):
-    """Exact equality of two attribute values: same types, dtypes and bits (-0.0 differs from 0.0)."""
+    """Exact equality of two attribute values: same types, dtypes and bits (-0.0 differs from 0.0).
+    When in doubt the values count as different (a graph then stores its own value)."""
     if type(a) is not type(b):
         return False
+    if isinstance(a, _EXACT):
+        return a == b
     if isinstance(a, (list, tuple)):
         return len(a) == len(b) and all(_equal(x, y) for x, y in zip(a, b))
     if isinstance(a, dict):
@@ -45,6 +60,11 @@ def _equal(a, b):
     if isinstance(a, (pd.Index, pd.Series)):
         if isinstance(a.dtype, pd.CategoricalDtype) and not (   # == ignores the order of unordered categories
                 isinstance(b.dtype, pd.CategoricalDtype) and _equal(a.dtype.categories, b.dtype.categories)):
+            return False
+        if isinstance(a, pd.MultiIndex):   # to_numpy gives tuples: the dtype of every level is lost
+            return (isinstance(b, pd.MultiIndex) and a.nlevels == b.nlevels and _equal(list(a.names), list(b.names))
+                    and all(_equal(a.get_level_values(k), b.get_level_values(k)) for k in range(a.nlevels)))
+        if _frequency(a) != _frequency(b):   # a DatetimeIndex, TimedeltaIndex or PeriodIndex keeps its step
             return False
         return (a.dtype == b.dtype and _equal(list(a.names) if isinstance(a, pd.Index) else a.name,
                                               list(b.names) if isinstance(b, pd.Index) else b.name)
@@ -61,9 +81,15 @@ def _equal(a, b):
                 and a.device == b.device and a.requires_grad == b.requires_grad
                 and torch.equal(_bits(a), _bits(b)))
     try:
-        return bool(a == b)
+        return bool(a == b) and _same_pickle(a, b)   # e.g. time zones, set element types
     except Exception:   # e.g. an object whose == is element-wise
         return False
+
+
+def _frequency(value):
+    """The step of a date or period index, as (name, string) so that None and an absent freq differ."""
+    freq = getattr(value, "freq", None)
+    return None if freq is None else (type(freq).__name__, str(freq))
 
 
 def _bits(t):
@@ -340,6 +366,11 @@ def _remove(path):
         pass
 
 
+def _is_bool(value):
+    """A boolean, which is refused as a graph index (a list would take True as 1)."""
+    return isinstance(value, (bool, np.bool_)) or (torch.is_tensor(value) and value.dtype == torch.bool)
+
+
 class DiskGraphs(torch.utils.data.Dataset):
     """
     Graphs kept in a folder on disk, loaded one at a time when accessed.
@@ -380,7 +411,7 @@ class DiskGraphs(torch.utils.data.Dataset):
         if isinstance(i, slice):
             return self.subset(range(len(self))[i])
         try:
-            if isinstance(i, (bool, np.bool_)) or (torch.is_tensor(i) and i.dtype == torch.bool):
+            if _is_bool(i):
                 raise TypeError
             i = operator.index(i)
         except TypeError:
@@ -403,31 +434,40 @@ class DiskGraphs(torch.utils.data.Dataset):
         """A view on the graphs at ``indices`` (positions in this sequence, in that order), or on the
         graphs where a boolean mask is true: an array of length ``len(self)``, or a boolean Series
         whose index labels are positions (as those of :attr:`index`, in any order)."""
+        if isinstance(indices, (set, frozenset)):
+            raise TypeError("graph indices must be ordered: pass a list, not a set")
         if isinstance(indices, pd.Series) and pd.api.types.is_bool_dtype(indices.dtype):
             indices = self._series_mask(indices)
         elif isinstance(indices, (pd.Series, pd.Index)):
             indices = indices.to_numpy()
         elif torch.is_tensor(indices):
             indices = indices.cpu().numpy()
-        elif isinstance(indices, (set, frozenset)):
-            raise TypeError("graph indices must be ordered: pass a list, not a set")
-        elif not isinstance(indices, np.ndarray) and not np.isscalar(indices):
+        elif not isinstance(indices, np.ndarray) and not hasattr(indices, "__array__") and not np.isscalar(indices):
             indices = list(indices)   # generators, map, dict_keys, ...
-        array = np.asarray(indices)
-        if array.dtype == bool:
+        if isinstance(indices, list):   # element by element, as numpy would promote mixed integer types
+            array = np.asarray(indices, dtype=bool) if indices and all(map(_is_bool, indices)) else None
+            items = indices
+        else:
+            array = np.asarray(indices)
+            items = array.ravel().tolist() if array.ndim else [array.item()]
+            if array.dtype == object and array.size and all(map(_is_bool, items)):
+                array = array.astype(bool)
+            elif array.dtype != bool and array.dtype.kind not in "iuO" and array.size:
+                raise TypeError(f"graph indices must be integers or a boolean mask, not {array.dtype}")
+        if array is not None and array.dtype == bool:
             if array.shape != (len(self),):
                 raise IndexError(f"a boolean mask must have one entry per graph ({len(self)}), "
                                  f"got shape {array.shape}")
-            indices = np.flatnonzero(array)
-        elif array.size and array.dtype.kind not in "iu":
-            try:   # objects with __index__, as a list accepts them
-                if array.dtype != object or any(isinstance(i, (bool, np.bool_)) for i in array.ravel()):
-                    raise TypeError
-                indices = np.array([operator.index(i) for i in array.ravel()], dtype=np.int64)
-            except TypeError:
-                raise TypeError(f"graph indices must be integers or a boolean mask, not {array.dtype}") from None
+            items = np.flatnonzero(array).tolist()
         positions = []
-        for i in np.asarray(indices).ravel().tolist() if array.ndim else [int(array)]:
+        for i in items:
+            try:
+                if _is_bool(i):
+                    raise TypeError
+                i = operator.index(i)
+            except TypeError:
+                raise TypeError("graph indices must be integers or a boolean mask, "
+                                f"not {type(i).__name__}") from None
             if not -len(self) <= i < len(self):
                 raise IndexError(f"graph index {i} out of range for {len(self)} graphs")
             positions.append(self._positions[i])
@@ -481,7 +521,7 @@ class DiskGraphs(torch.utils.data.Dataset):
         shared = self._index["shared"]
         if self._positions:
             row = self._index["graphs"][self._positions[0]]
-            if name not in row.get("shared_names", tuple(shared)):
+            if name not in row.get("shared_names", ()):   # (folders written before it was recorded)
                 return getattr(self[0], name, None)
         return copy.deepcopy(shared.get(name))
 

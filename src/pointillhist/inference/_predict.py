@@ -410,30 +410,44 @@ def _predict_to_parquet(net, graphs, positions, top_k, out, wanted, device, temp
     if distributed and device.type == "cuda" and dist.get_backend() == "nccl":
         torch.cuda.set_device(device)   # the object collectives below run on the current device
 
-    # start: process 0 checks and prepares the folder; every process must see its marker
-    created = []
-    plan = [None, None]
+    # start: process 0 checks and prepares the folder (a failure is passed on to the other processes);
+    # every process must then see its marker
+    created, failure = [], None
+    plan = [None, None, None]   # kind of problem, its message, token
     if rank == 0:
-        problem = _output_problem(out)
-        if not problem:
-            created = [folder for folder in (out, os.path.join(out, "cells"), os.path.join(out, "grid"))
-                       if not os.path.exists(folder)]
-            os.makedirs(out, exist_ok=True)
-            for kind in ("cells", "grid"):   # temporary parts left by a killed run
-                folder = os.path.join(out, kind)
-                for name in os.listdir(folder) if os.path.isdir(folder) else []:
-                    if _is_temporary(name):
-                        _remove(os.path.join(folder, name))
-            token = uuid.uuid4().hex
-            open(os.path.join(out, f"_writing-{token}"), "w").close()
-            plan = [None, token]
-        else:
-            plan = [problem, None]
+        try:
+            problem = _output_problem(out)
+            if problem:
+                plan = ["exists", problem, None]
+            else:
+                created = [folder for folder in (out, os.path.join(out, "cells"), os.path.join(out, "grid"))
+                           if not os.path.exists(folder)]
+                os.makedirs(out, exist_ok=True)
+                for kind in ("cells", "grid"):   # temporary parts left by a killed run
+                    folder = os.path.join(out, kind)
+                    for name in os.listdir(folder) if os.path.isdir(folder) else []:
+                        if _is_temporary(name):
+                            _remove(os.path.join(folder, name))
+                token = uuid.uuid4().hex
+                open(os.path.join(out, f"_writing-{token}"), "w").close()
+                plan = [None, None, token]
+        except Exception as error:
+            failure = error
+            for folder in reversed(created):
+                try:
+                    os.rmdir(folder)
+                except OSError:
+                    pass
+            plan = ["failed", f"process 0 could not prepare {out}: {type(error).__name__}: {error}", None]
     if distributed:   # the only collectives: every process starts predict at the same point
         dist.broadcast_object_list(plan, src=0)
-    problem, token = plan
-    if problem:
+    kind, problem, token = plan
+    if failure is not None:
+        raise failure
+    if kind == "exists":
         raise FileExistsError(problem)
+    if kind is not None:
+        raise RuntimeError(problem)
     marker = os.path.join(out, f"_writing-{token}")
     seen = [os.path.exists(marker)]
     if distributed:
@@ -523,7 +537,9 @@ def _write_parts(pa, pq, net, graphs, positions, top_k, out, wanted, device, tem
         os.makedirs(os.path.dirname(path), exist_ok=True)
     writers, buffers = {}, {kind: [] for kind in paths}
     buffered = {kind: [0, 0] for kind in paths}   # bytes, rows
-    done, dtypes = [], {}
+    done, dtypes, measured = [], {}, False   # measured: on a graph with core cells
+    if first is not None:
+        dtypes = _output_dtypes(first)
     names = np.asarray(cell_types)
 
     def flush(kind):
@@ -537,8 +553,8 @@ def _write_parts(pa, pq, net, graphs, positions, top_k, out, wanted, device, tem
             writers[kind] = pq.ParquetWriter(_temporary(path), schema if kind == "cells" else grid_schema)
         for position in tqdm.tqdm(share, desc="Predicting", disable=rank != 0):
             piece, first = (predicted(position) if first is None else first), None
-            if piece["n_cells"] and not dtypes:
-                dtypes = _output_dtypes(piece)
+            if piece["n_cells"] and not measured:
+                dtypes, measured = _output_dtypes(piece), True
             if "all_cell_types" in written:
                 piece["cell_types"] = names[piece["all_labels"]]
             tables = dict(zip(("cells", "grid"), _tables(pa, piece, position, schema, grid_schema, axes)))
@@ -563,7 +579,7 @@ def _write_parts(pa, pq, net, graphs, positions, top_k, out, wanted, device, tem
     for path in paths.values():
         os.replace(_temporary(path), path)
     rows_path = _rows_path(out, rank, world_size)
-    torch.save({"rows": done, "dtypes": dtypes}, f"{rows_path}.tmp{os.getpid()}")
+    torch.save({"rows": done, "dtypes": dtypes, "measured": measured}, f"{rows_path}.tmp{os.getpid()}")
     os.replace(f"{rows_path}.tmp{os.getpid()}", rows_path)
     return dict(fields=written, top_k=top_k, cell_types=cell_types, axes=axes, grid=grid_schema is not None,
                 pos_dtype=_position_dtype(schema, grid_schema, axes), n_genes=net.n_genes,
@@ -615,7 +631,8 @@ def _write_meta(out, graphs, world_size, details, marker):
         raise RuntimeError("the processes did not predict every graph once; were the graphs the same everywhere?")
     labels = zip(*(_graph_values(graphs, name) for name in ("section_label", "timepoint_label",
                                                              "condition_label")))
-    dtypes = next((share["dtypes"] for share in shares if share["dtypes"]), {})
+    dtypes = next((share["dtypes"] for share in shares if share.get("measured")),
+                  next((share["dtypes"] for share in shares if share["dtypes"]), {}))
     meta = dict(format=FORMAT, n_graphs=len(graphs), world_size=world_size, dtypes=dtypes, **details,
                 graphs=[dict(section_label=s, timepoint_label=t, condition_label=c, n_cells=n, n_grid=m,
                              ids_dtype=d)
