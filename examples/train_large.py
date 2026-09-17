@@ -32,8 +32,9 @@ import pointillhist as ph
 # ---- inputs ---------------------------------------------------------------
 SECTIONS = sorted(glob.glob("data/sections/*.h5ad"))   # one .h5ad per section (or (dots.csv, cells.csv) pairs)
 REFERENCE = "data/reference.csv"                       # cell types x genes
-GRAPH_KWARGS = {}                                      # tiling parameters, "auto" by default
-TRAIN_KWARGS = dict(batch_size=2, num_epochs=100)      # batch_size is per GPU with torchrun
+GRAPH_KWARGS = dict(n_workers=8)                       # sections built at a time; tiling parameters are "auto"
+TRAIN_KWARGS = dict(batch_size=2, num_epochs=100,      # batch_size is per GPU with torchrun
+                    prefetch=2)                        # graphs loaded ahead in a background thread
 WORK = "work"                                          # graphs, checkpoints, network and predictions
 
 args = [a for a in sys.argv[1:] if a != "--demo"]
@@ -42,7 +43,7 @@ if "--demo" in sys.argv:
     SECTIONS = [(os.path.join(skin, "dots.csv"), os.path.join(skin, "cells.csv"))]
     REFERENCE = pd.read_csv(os.path.join(skin, "cell_type_expression.csv"), index_col=0).T
     GRAPH_KWARGS = dict(tile_side=300, fraction_overlap=0.1, grid_spacing=40, cell_cell_maxdist=60)
-    TRAIN_KWARGS = dict(batch_size=2, num_epochs=30)
+    TRAIN_KWARGS = dict(batch_size=2, num_epochs=30, prefetch=2)
     if not args:
         args = ["build+train", tempfile.mkdtemp(prefix="pointillhist_large_demo_")]
 if not args or args[0] not in ("build", "train", "build+train"):

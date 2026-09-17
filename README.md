@@ -141,10 +141,12 @@ result = ph.eval.read_predictions("work/predictions", sections=["section_1.h5ad"
   which each function loads the graphs it needs one at a time. `ph.pp.load_graphs(folder)`
   opens it again later, and `ph.pp.save_graphs(graphs, folder)` writes an existing list.
   Building the graphs holds one section at a time (its counts and all its tiles), so a
-  section too large for memory on its own has to be split into several files first.
+  section too large for memory on its own has to be split into several files first;
+  `n_workers=` builds that many sections at a time, each in its own process.
 - Training holds one batch of graphs. The dispersions and distance scalers are estimated
   before training from at most 1000 randomly chosen graphs of a `DiskGraphs`;
-  `setup_graphs=None` uses all of them, still one at a time.
+  `setup_graphs=None` uses all of them, still one at a time. `prefetch=` loads that many
+  upcoming graphs in a background thread while the GPU works, with the same results.
 - `predict(..., out=)` writes one row per cell to the Parquet dataset `work/predictions/cells`
   (predicted type, the five largest probabilities, position, cell id, section, timepoint,
   condition), which `pandas.read_parquet` reads directly; `fields=` adds the logits,
