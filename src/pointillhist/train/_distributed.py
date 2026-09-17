@@ -7,14 +7,17 @@ import tqdm
 from torch.nn.utils import clip_grad_norm_
 from torch.utils.data import DataLoader, DistributedSampler
 
+from ..preprocessing._store import DiskGraphs
 from ._losses import total_loss
-from ._setup import setup_training
+from ._setup import _initialize_from_disk, _optimizer, setup_training
 from ._train import (
     LOSS_KEYS,
-    _graph_bytes,
     _lambda_anatomical_schedule,
     _lambda_density_schedule,
     _reference,
+    _resident_bytes,
+    _setup_subset,
+    _to_device,
     _type_priors,
     _type_regions,
     train,
@@ -64,6 +67,7 @@ def train_distributed(
     checkpoint_dir=None,
     keep_on_device="auto",
     device=None,
+    setup_graphs="auto",
 ):
     """
     :func:`train` on several processes, one per GPU: ``torchrun --nproc_per_node=<n_gpus> script.py``.
@@ -73,6 +77,11 @@ def train_distributed(
     loaded from one saved file). ``device=None`` (or ``"cuda"``) is the GPU ``LOCAL_RANK``. A missing process
     group is created (nccl on GPU, gloo on CPU); end the script with ``torch.distributed.destroy_process_group()``.
     Without torchrun (no process group, ``WORLD_SIZE`` unset or 1) this is exactly :func:`train`.
+
+    Setup: with a list, process 0 estimates the dispersions and distance scalers alone while the others
+    wait (a very long setup can exceed the NCCL timeout, see ``setup_graphs``). With a DiskGraphs (one
+    folder read by every process) each process reads its share of the setup graphs and the results are
+    combined, so no process waits for the others.
 
     Returns
     -------
@@ -106,12 +115,18 @@ def train_distributed(
     net.eval()
     if main:
         print(f"Initializing (dispersions, distance scalers, optimizer) for {world_size} processes...")
-    # only rank 0 estimates from every graph; all ranks then start from its parameters and buffers
-    optimizer, scheduler = setup_training(
-        net, graphs if main else graphs[:1], device=device,
-        lr=lr, weight_decay=weight_decay, T_0=T_0, eta_min=eta_min,
-        cell_loss_type=cell_loss_type,
-    )
+    setup_set = _setup_subset(graphs, setup_graphs)
+    if isinstance(graphs, DiskGraphs):
+        # every rank reads its share of the setup graphs; the shares are combined
+        _initialize_from_disk(net, setup_set, device, cell_loss_type, distributed=True)
+        optimizer, scheduler = _optimizer(net, lr, weight_decay, T_0, eta_min)
+    else:
+        # only rank 0 estimates from the setup graphs; all ranks then start from its parameters and buffers
+        optimizer, scheduler = setup_training(
+            net, setup_set if main else graphs[:1], device=device,
+            lr=lr, weight_decay=weight_decay, T_0=T_0, eta_min=eta_min,
+            cell_loss_type=cell_loss_type,
+        )
     net.temperature.fill_(temperature)
     for tensor in [*net.parameters(), *net.buffers()]:
         dist.broadcast(tensor.data, src=0)
@@ -145,8 +160,7 @@ def train_distributed(
     else:
         keep = bool(keep_on_device)
         if keep:
-            for graph in graphs:
-                graph.to(device)
+            graphs = _to_device(graphs, device)
 
     bar = tqdm.tqdm(total=num_epochs * len(data_loader), desc="Training", disable=not main)
 
@@ -228,12 +242,11 @@ def train_distributed(
 
         if keep is None:      # "auto": the first epoch measured the working set of a step (one graph included)
             peak = torch.cuda.max_memory_allocated(device)
-            resident = sum(_graph_bytes(g) for g in graphs)
+            resident = _resident_bytes(graphs)
             capacity = torch.cuda.mem_get_info(device)[1]
             keep = resident + peak <= 0.95 * capacity
             if keep:
-                for graph in graphs:
-                    graph.to(device)
+                graphs = _to_device(graphs, device)
                 if main:
                     bar.write(f"graphs kept on {device}: {resident / 1e9:.1f} GB of graphs + {peak / 1e9:.1f} GB peak "
                               f"per step fit in 95 % of {capacity / 1e9:.0f} GB")

@@ -38,6 +38,13 @@ def _equal(a, b):
     return bool(a == b)
 
 
+def _graph_values(graphs, name):
+    """Per-graph value of a graph attribute; a DiskGraphs reads it from its index."""
+    if isinstance(graphs, DiskGraphs):
+        return graphs._column(name)
+    return [getattr(g, name) for g in graphs]
+
+
 # ---------------------------------------------------------------- tensors
 def _pack_tensor(t):
     """Lossless compact form of a tensor: int32 for int64 values that fit, CSR for sparse 2-D floats."""

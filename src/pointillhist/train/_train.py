@@ -9,10 +9,14 @@ from torch.nn.utils import clip_grad_norm_
 from torch.utils.data import DataLoader
 
 from ..preprocessing._reference import load_reference
+from ..preprocessing._store import DiskGraphs, _graph_values
 from ._setup import setup_training
 from ._losses import total_loss
 
 __all__ = ["train"]
+
+#: ``setup_graphs="auto"`` estimates the setup from at most this many graphs of a DiskGraphs.
+SETUP_GRAPHS_DISK = 1000
 
 #: Order must match the tuple returned by :func:`total_loss`.
 LOSS_KEYS = [
@@ -85,6 +89,43 @@ def _graph_bytes(graph):
     return sum(v.numel() * v.element_size() for store in graph.stores for v in store.values() if torch.is_tensor(v))
 
 
+def _resident_bytes(graphs):
+    """Device memory the graphs take when all of them are kept there."""
+    if isinstance(graphs, DiskGraphs):
+        return graphs.nbytes
+    return sum(_graph_bytes(g) for g in graphs)
+
+
+def _to_device(graphs, device):
+    """The graphs kept on ``device``: a list is moved in place, a DiskGraphs is loaded graph by graph."""
+    if isinstance(graphs, DiskGraphs):
+        return [graph.to(device) for graph in graphs]
+    for graph in graphs:
+        graph.to(device)
+    return graphs
+
+
+def _setup_subset(graphs, setup_graphs):
+    """The graphs the setup estimates from: all of them, or ``k`` drawn with a fixed seed (the
+    same on every process; the global random state is not used)."""
+    n = len(graphs)
+    if isinstance(setup_graphs, str) and setup_graphs == "auto":
+        k = min(n, SETUP_GRAPHS_DISK) if isinstance(graphs, DiskGraphs) else n
+    elif setup_graphs is None:
+        k = n
+    elif isinstance(setup_graphs, (int, np.integer)) and not isinstance(setup_graphs, (bool, np.bool_)) \
+            and setup_graphs >= 1:
+        k = min(n, int(setup_graphs))
+    else:
+        raise ValueError(f'setup_graphs must be "auto", None or a positive integer, got {setup_graphs!r}')
+    if k == n:
+        return graphs
+    chosen = np.sort(np.random.default_rng(0).choice(n, size=k, replace=False))
+    if isinstance(graphs, DiskGraphs):
+        return graphs.subset(chosen)
+    return [graphs[i] for i in chosen]
+
+
 def _reference(reference, graphs):
     """(K, G) float tensor aligned to the graphs' cell types and genes."""
     if isinstance(reference, (torch.Tensor, np.ndarray)):
@@ -102,7 +143,7 @@ def _type_priors(type_priors, graphs):
         )
     cell_types = list(graphs[0].cell_types)
     K = len(cell_types)
-    labels = {g.timepoint: g.timepoint_label for g in graphs}
+    labels = dict(zip(_graph_values(graphs, "timepoint"), _graph_values(graphs, "timepoint_label")))
     n_timepoints = max(labels) + 1
 
     if isinstance(type_priors, str) and type_priors == "uniform":
@@ -194,14 +235,17 @@ def train(
     checkpoint_dir=None,
     keep_on_device="auto",
     device=None,
+    setup_graphs="auto",
 ):
     """
     Train the network, reporting a running average of each loss term per epoch.
 
     Parameters
     ----------
-    graphs : list of HeteroData
+    graphs : list of HeteroData or DiskGraphs
         Output of ``generate_graphs``; sizes, timepoints and regions are read from it.
+        A DiskGraphs (``generate_graphs(..., save_dir=...)``) is read one graph at a
+        time, so host memory does not grow with the number of graphs.
     reference : DataFrame | csv path | (K, G) tensor/array
         Cell types x genes expression profiles, aligned by name to the graphs.
     type_priors : "uniform" | DataFrame/csv (cell types x timepoint labels) | (K,) array/Series/tensor
@@ -227,7 +271,15 @@ def train(
         copying mode while the peak memory of a step is measured; from the
         second epoch on the graphs stay resident if all of them plus that peak
         fit in 95 % of the device memory, otherwise a note is printed and the
-        copying mode continues. Irrelevant on a CPU device.
+        copying mode continues. Irrelevant on a CPU device. With a DiskGraphs the
+        graphs are loaded from disk for each step in the copying mode, and loaded
+        onto the device one by one when they are kept there.
+    setup_graphs : "auto" | None | int
+        Graphs the dispersions and distance scalers are estimated from before
+        training. None: all of them. An integer k: k graphs drawn with a fixed
+        seed (all of them if there are fewer), a faster approximation for large
+        datasets. "auto" (default): all graphs of a list, at most 1000 of a
+        DiskGraphs.
 
     Returns
     -------
@@ -247,7 +299,7 @@ def train(
     net.eval()
     print("Initializing (dispersions, distance scalers, optimizer)...")
     optimizer, scheduler = setup_training(
-        net, graphs, device=device,
+        net, _setup_subset(graphs, setup_graphs), device=device,
         lr=lr, weight_decay=weight_decay, T_0=T_0, eta_min=eta_min,
         cell_loss_type=cell_loss_type,
     )
@@ -279,8 +331,7 @@ def train(
     else:
         keep = bool(keep_on_device)
         if keep:
-            for graph in graphs:
-                graph.to(device)
+            graphs = _to_device(graphs, device)
 
     bar = tqdm.tqdm(total=num_epochs * len(data_loader), desc="Training")
 
@@ -366,12 +417,11 @@ def train(
         if keep is None:      # "auto": the first epoch measured the working set of a step (one graph included)
             index = torch.cuda.current_device() if device.index is None else device.index
             peak = torch.cuda.max_memory_allocated(index)
-            resident = sum(_graph_bytes(g) for g in graphs)
+            resident = _resident_bytes(graphs)
             capacity = torch.cuda.mem_get_info(index)[1]
             keep = resident + peak <= 0.95 * capacity
             if keep:
-                for graph in graphs:
-                    graph.to(device)
+                graphs = _to_device(graphs, device)
                 bar.write(f"graphs kept on {device}: {resident / 1e9:.1f} GB of graphs + {peak / 1e9:.1f} GB peak per step "
                           f"fit in 95 % of {capacity / 1e9:.0f} GB")
             else:
