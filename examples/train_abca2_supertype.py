@@ -1,13 +1,24 @@
 """
 Zhuang ABCA-2 (MERFISH, 66 coronal sections) mapped to the ~1200 Yao 2023 supertypes with pointillhist.
 """
-import glob
 import os
+
+# Full determinism for PyTorch Geometric operations may make training slower.
+os.environ["CUBLAS_WORKSPACE_CONFIG"] = ":4096:8"  # Before importing PyTorch.
+
+import glob
 import pickle
+import random
 
 import numpy as np
 import pandas as pd
 import torch
+
+torch.use_deterministic_algorithms(True, warn_only=False)
+SEED = 0
+random.seed(SEED)
+np.random.seed(SEED)
+torch.manual_seed(SEED)  # Seeds CPU and CUDA.
 
 import pointillhist as ph
 

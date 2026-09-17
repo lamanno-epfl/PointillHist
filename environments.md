@@ -1,8 +1,8 @@
-# Environment
+# Environments
 
 ## Supported versions
 
-[`pyproject.toml`](../pyproject.toml) declares the dependency ranges and `pip install`
+[`pyproject.toml`](pyproject.toml) declares the dependency ranges and `pip install`
 resolves them for your Python. The lower bounds are at or below the versions the manuscript
 results were produced with (the same minor series in every case except `numpy`, 1.26 against
 2.1) and the package was verified at exactly these floors; it is also run on current
@@ -28,7 +28,7 @@ releases, and the two columns below are the two environments we use.
 molecule-table (`dots.csv`, `cells.csv`) path of `generate_graphs` fails on it; the AnnData
 path works.
 
-[`uv.lock`](../uv.lock) is a locked resolution of these ranges for `uv sync`, computed
+[`uv.lock`](uv.lock) is a locked resolution of these ranges for `uv sync`, computed
 separately for Python 3.10, 3.11 and 3.12 or newer, so the versions it installs depend on the
 Python minor (in September 2026: torch 2.14, PyTorch Geometric 2.8, pandas 2.3 and anndata
 0.11 to 0.13). We ran our internal tests on all three resolutions, with Python 3.10 to 3.14,
@@ -69,7 +69,7 @@ uv pip install torch --torch-backend=auto                               # uv: pi
 ```
 
 With uv, from the root of a clone (`git clone` and `cd PointillHist` as in the
-[installation guide](../guide/installation.md)), there
+[installation guide](guide/installation.md)), there
 are two ways to get a different `torch` than the locked CUDA 13 build. Either skip the lock and
 install into a plain virtual environment (`--torch-backend=auto` picks the CUDA build matching
 the installed driver, `cpu` the CPU build):
@@ -98,3 +98,29 @@ uv pip install -e . torch_geometric==2.6.1 anndata==0.10.9 numpy==2.1.0 scipy==1
 
 (`python -m venv` and `pip` work the same way.) `anndata` 0.10 needs `scipy` < 1.15 to read
 backed `.h5ad` files, which is why that combination pins `scipy==1.14.1`.
+
+## Reproducibility
+
+For fully deterministic GPU training and prediction, use the same inputs, settings,
+hardware and software environment across runs. Add this at the start of your script,
+before importing PointillHist or generating graphs. In a notebook, restart the kernel
+and run it first:
+
+```python
+import os
+os.environ["CUBLAS_WORKSPACE_CONFIG"] = ":4096:8"  # Before any CUDA use.
+
+import random
+import numpy as np
+import torch
+
+SEED = 0
+random.seed(SEED)
+np.random.seed(SEED)
+torch.manual_seed(SEED)  # Seeds CPU and CUDA.
+torch.use_deterministic_algorithms(True)
+```
+
+Repeat this setup and create a fresh model for each run; keep deterministic algorithms
+enabled through prediction. Deterministic algorithms can make training slower. See
+[PyTorch's reproducibility guidance](https://docs.pytorch.org/docs/stable/notes/randomness.html).

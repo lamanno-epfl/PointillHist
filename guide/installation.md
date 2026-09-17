@@ -5,7 +5,7 @@ PointillHist is a pure-Python package for Python 3.10 or later. Its dependencies
 `scikit-learn`) are installed automatically; the compiled extensions of PyTorch Geometric
 (`pyg_lib`, `torch_scatter`, ...) are not needed. We develop and test on Linux with NVIDIA
 GPUs; training on the CPU works but is slow. The supported version ranges, the tested
-environments and the platform notes are in [`docs/environment.md`](../docs/environment.md).
+environments and the platform notes are in [`environments.md`](../environments.md).
 
 Two extras exist: `umap` adds `umap-learn` for `ph.eval.umap`, and `examples` adds
 `ipykernel`, to run the example notebooks, and `openpyxl`, which the ABCA-2 example needs to
@@ -74,7 +74,7 @@ uv pip install torch --torch-backend=auto                               # uv: pi
 
 The Windows wheel on PyPI is CPU-only and macOS has no CUDA; Intel Macs are not supported
 because `torch` 2.4 and later ship no wheels for them. Details in
-[`docs/environment.md`](../docs/environment.md#platforms-cuda-and-cpu-builds-of-torch).
+[`environments.md`](../environments.md#platforms-cuda-and-cpu-builds-of-torch).
 
 ## Checking the installation
 
@@ -98,4 +98,4 @@ uv pip install nbclient && uv run --no-sync jupyter execute examples/minimal.ipy
 `pyg_lib` and the other compiled PyTorch Geometric extensions are optional accelerators whose
 wheels must match your `torch` and CUDA versions; the commands, and a recipe that reproduces
 the exact versions the manuscript results were produced with, are in
-[`docs/environment.md`](../docs/environment.md).
+[`environments.md`](../environments.md).
