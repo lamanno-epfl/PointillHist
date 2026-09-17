@@ -1,3 +1,4 @@
+import itertools
 import math
 import os
 import warnings
@@ -21,6 +22,21 @@ from ._topology import (
 __all__ = ["generate_graphs", "auto_graph_parameters"]
 
 
+def _inside(df, box):
+    """Mask of the rows of ``df`` inside ``box`` ({axis: (start, end)}, end excluded)."""
+    mask = True
+    for axis, (start, end) in box.items():
+        mask = mask & (df[axis] >= start) & (df[axis] < end)
+    return mask
+
+
+def _cut(df, core, extended):
+    """Rows of ``df`` inside the ``extended`` box, with 'is_core' for those inside ``core``."""
+    tile = df[_inside(df, extended)].copy()
+    tile["is_core"] = _inside(tile, core)
+    return tile
+
+
 def split_into_tiles(
     df_cells,
     df_gridpoints,
@@ -30,17 +46,19 @@ def split_into_tiles(
     fraction_overlap=0.2,
     pad_fraction=0.05,
 ):
-    """Divide the full field of view into square tiles of side ``tile_side``.
+    """Divide the full field of view into square (cubic in 3D) tiles of side ``tile_side``.
 
     Each tile has a unique core and a frame of ``fraction_overlap * tile_side``
     shared with its neighbours. ``df_cells``, ``df_gridpoints`` and the optional
-    ``df_dots`` / ``df_cells_features`` need 'X' and 'Y' columns; each is cut
-    per tile and gets an 'is_core' column. On the dots path only tiles with at
-    least one core dot are kept, and no cell features are returned.
+    ``df_dots`` / ``df_cells_features`` need 'X' and 'Y' columns (and 'Z' if
+    ``df_cells`` has one); each is cut per tile and gets an 'is_core' column.
+    On the dots path only tiles with at least one core dot are kept, and no
+    cell features are returned.
 
     Returns (vertexes, core_vertexes, cells_dfs, dots_dfs, cells_features_dfs,
     gridpoints_dfs), one entry per tile (``dots_dfs`` / ``cells_features_dfs``
-    is None when the corresponding input is None).
+    is None when the corresponding input is None). Vertexes are
+    (x_min, x_max, y_min, y_max[, z_min, z_max]).
     """
     (
         fovs_cells_df,
@@ -51,126 +69,60 @@ def split_into_tiles(
         fovs_gridpoints_df,
     ) = ([], [], [], [], [], [])
 
-    if df_dots is not None:
-        # Calculate the range for X and Y coordinates
-        x_min, x_max = min(df_cells["X"].min(), df_dots["X"].min()), max(
-            df_cells["X"].max(), df_dots["X"].max()
-        )
-        y_min, y_max = min(df_cells["Y"].min(), df_dots["Y"].min()), max(
-            df_cells["Y"].max(), df_dots["Y"].max()
-        )
-    else:
-        # If no dots are provided, use only cells to determine the range
-        x_min, x_max = df_cells["X"].min(), df_cells["X"].max()
-        y_min, y_max = df_cells["Y"].min(), df_cells["Y"].max()
+    axes = [axis for axis in ("X", "Y", "Z") if axis in df_cells.columns]
+    starts, num_grids = [], []
+    for axis in axes:
+        if df_dots is not None:
+            # Calculate the range of the cells and dots
+            low = min(df_cells[axis].min(), df_dots[axis].min())
+            high = max(df_cells[axis].max(), df_dots[axis].max())
+        else:
+            # If no dots are provided, use only cells to determine the range
+            low, high = df_cells[axis].min(), df_cells[axis].max()
 
-    # Add a bit of a frame
-    x_range = x_max - x_min
-    y_range = y_max - y_min
+        # Add a bit of a frame
+        extent = high - low
+        start = low - pad_fraction * extent
+        end = high + pad_fraction * extent
+        starts.append(start)
+        num_grids.append(int(np.ceil((end - start) / tile_side)))
 
-    x_left = x_min - pad_fraction * x_range
-    x_right = x_max + pad_fraction * x_range
-    y_bottom = y_min - pad_fraction * y_range
-    y_top = y_max + pad_fraction * y_range
+    if df_cells_features is not None:
+        for axis in axes:
+            df_cells_features[axis] = df_cells[axis]
 
-    # Determine the number of grids in X and Y directions
-    num_grids_x = int(np.ceil((x_right - x_left) / tile_side))
-    num_grids_y = int(np.ceil((y_top - y_bottom) / tile_side))
+    for index in itertools.product(*[range(n) for n in num_grids]):
+        # Core tile boundaries, and the extended ones (with overlap)
+        core, extended = {}, {}
+        for axis, start, i in zip(axes, starts, index):
+            start_core = start + i * tile_side
+            end_core = start_core + tile_side
+            core[axis] = (start_core, end_core)
+            extended[axis] = (start_core - fraction_overlap * tile_side,
+                              end_core + fraction_overlap * tile_side)
+        core_vertexes = tuple(v for bounds in core.values() for v in bounds)
+        vertexes = tuple(v for bounds in extended.values() for v in bounds)
 
-    for i in range(num_grids_x):
-        for j in range(num_grids_y):
-            # Calculate core tile boundaries
-            x_start_core = x_left + i * tile_side
-            x_end_core = x_start_core + tile_side
-            y_start_core = y_bottom + j * tile_side
-            y_end_core = y_start_core + tile_side
+        tile_df_cells = _cut(df_cells, core, extended)
+        tile_df_gridpoints = _cut(df_gridpoints, core, extended)
 
-            # Calculate extended tile boundaries (with overlap)
-            x_start_extended = x_start_core - fraction_overlap * tile_side
-            x_end_extended = x_end_core + fraction_overlap * tile_side
-            y_start_extended = y_start_core - fraction_overlap * tile_side
-            y_end_extended = y_end_core + fraction_overlap * tile_side
+        if df_dots is not None:
+            tile_df_dots = _cut(df_dots, core, extended)
+            if tile_df_dots["is_core"].sum() > 0:
+                fovs_core_vertexes.append(core_vertexes)
+                fovs_vertexes.append(vertexes)
 
-            tile_df_cells = df_cells[
-                (df_cells["X"] >= x_start_extended)
-                & (df_cells["X"] < x_end_extended)
-                & (df_cells["Y"] >= y_start_extended)
-                & (df_cells["Y"] < y_end_extended)
-            ].copy()
-
-            tile_df_cells["is_core"] = (
-                (tile_df_cells["X"] >= x_start_core)
-                & (tile_df_cells["X"] < x_end_core)
-                & (tile_df_cells["Y"] >= y_start_core)
-                & (tile_df_cells["Y"] < y_end_core)
-            )
-
-            tile_df_gridpoints = df_gridpoints[
-                (df_gridpoints["X"] >= x_start_extended)
-                & (df_gridpoints["X"] < x_end_extended)
-                & (df_gridpoints["Y"] >= y_start_extended)
-                & (df_gridpoints["Y"] < y_end_extended)
-            ].copy()
-
-            tile_df_gridpoints["is_core"] = (
-                (tile_df_gridpoints["X"] >= x_start_core)
-                & (tile_df_gridpoints["X"] < x_end_core)
-                & (tile_df_gridpoints["Y"] >= y_start_core)
-                & (tile_df_gridpoints["Y"] < y_end_core)
-            )
-            if df_cells_features is not None:
-                df_cells_features["X"] = df_cells["X"]
-                df_cells_features["Y"] = df_cells["Y"]
-                tile_df_cells_features = df_cells_features[
-                    (df_cells_features["X"] >= x_start_extended)
-                    & (df_cells_features["X"] < x_end_extended)
-                    & (df_cells_features["Y"] >= y_start_extended)
-                    & (df_cells_features["Y"] < y_end_extended)
-                ].copy()
-                tile_df_cells_features["is_core"] = (
-                    (tile_df_cells_features["X"] >= x_start_core)
-                    & (tile_df_cells_features["X"] < x_end_core)
-                    & (tile_df_cells_features["Y"] >= y_start_core)
-                    & (tile_df_cells_features["Y"] < y_end_core)
-                )
-
-            if df_dots is not None:
-                tile_df_dots = df_dots[
-                    (df_dots["X"] >= x_start_extended)
-                    & (df_dots["X"] < x_end_extended)
-                    & (df_dots["Y"] >= y_start_extended)
-                    & (df_dots["Y"] < y_end_extended)
-                ].copy()
-
-                tile_df_dots["is_core"] = (
-                    (tile_df_dots["X"] >= x_start_core)
-                    & (tile_df_dots["X"] < x_end_core)
-                    & (tile_df_dots["Y"] >= y_start_core)
-                    & (tile_df_dots["Y"] < y_end_core)
-                )
-                if tile_df_dots["is_core"].sum() > 0:
-                    fovs_core_vertexes.append(
-                        (x_start_core, x_end_core, y_start_core, y_end_core)
-                    )
-                    fovs_vertexes.append(
-                        (x_start_extended, x_end_extended, y_start_extended, y_end_extended)
-                    )
-
-                    fovs_cells_df.append(tile_df_cells)
-                    fovs_dots_df.append(tile_df_dots)
-                    fovs_gridpoints_df.append(tile_df_gridpoints)
-                fovs_cells_features_df = None
-            else:
-                fovs_dots_df = None
                 fovs_cells_df.append(tile_df_cells)
-                fovs_cells_features_df.append(tile_df_cells_features)
-                fovs_core_vertexes.append(
-                    (x_start_core, x_end_core, y_start_core, y_end_core)
-                )
-                fovs_vertexes.append(
-                    (x_start_extended, x_end_extended, y_start_extended, y_end_extended)
-                )
+                fovs_dots_df.append(tile_df_dots)
                 fovs_gridpoints_df.append(tile_df_gridpoints)
+            fovs_cells_features_df = None
+        else:
+            fovs_dots_df = None
+            fovs_cells_df.append(tile_df_cells)
+            fovs_cells_features_df.append(_cut(df_cells_features, core, extended))
+            fovs_core_vertexes.append(core_vertexes)
+            fovs_vertexes.append(vertexes)
+            fovs_gridpoints_df.append(tile_df_gridpoints)
 
     return (
         fovs_vertexes,
@@ -183,13 +135,32 @@ def split_into_tiles(
 
 
 def _read_dots(path_dots):
-    """Dots csv with columns X, Y, gene (accepts x/y and target)."""
+    """Dots csv with columns X, Y[, Z], gene (accepts x/y/z and target)."""
     df_dots = pd.read_csv(path_dots)
     if "X" not in df_dots.columns:
         df_dots.rename(columns={"x": "X", "y": "Y"}, inplace=True)
+    if "Z" not in df_dots.columns:
+        df_dots.rename(columns={"z": "Z"}, inplace=True)
     if "gene" not in df_dots.columns:
         df_dots.rename(columns={"target": "gene"}, inplace=True)
     return df_dots
+
+
+def _axes(cells):
+    """Coordinate columns of a section: X, Y, plus Z if present, numeric and not constant."""
+    z = cells.get("Z")
+    is_3d = z is not None and pd.api.types.is_numeric_dtype(z) and z.nunique() > 1
+    return ["X", "Y", "Z"] if is_3d else ["X", "Y"]
+
+
+def _anndata_coordinates(adata):
+    """X, Y[, Z] of the cells, from ``obsm["spatial"]`` (2 or 3 columns) or ``obs["x"/"y"/"z"]``."""
+    if "spatial" in adata.obsm:
+        cells = pd.DataFrame(np.asarray(adata.obsm["spatial"])[:, :3], index=adata.obs_names)
+    else:
+        cells = adata.obs[[c for c in ("x", "y", "z") if c in adata.obs.columns]]
+    cells = cells.set_axis(["X", "Y", "Z"][:cells.shape[1]], axis=1)
+    return cells[_axes(cells)]
 
 
 def _graphs_from_tables(
@@ -217,21 +188,25 @@ def _graphs_from_tables(
     df_dots.reset_index(drop=True, inplace=True)
 
     df_cell = pd.read_csv(path_cells)
+    if region_key is not None:
+        df_cell["region"] = df_cell[region_key]  # kept apart from a region column named z/Z
     if "X" not in df_cell.columns:
-        df_cell.rename(columns={"x": "X", "y": "Y"}, inplace=True)
+        df_cell.rename(columns={"x": "X", "y": "Y", "z": "Z"}, inplace=True)
     if "unique_cell_id" not in df_cell.columns:
         df_cell["unique_cell_id"] = df_cell.index.astype(str)
-    columns = ["X", "Y", "unique_cell_id"] + ([region_key] if region_key is not None else [])
+    axes = _axes(df_cell)
+    if "Z" in axes and "Z" not in df_dots.columns:
+        raise ValueError(f"{path_cells} has z coordinates but {path_dots} has none")
+    columns = axes + ["unique_cell_id"] + (["region"] if region_key is not None else [])
     df_cell = df_cell[columns]
+    df_dots = df_dots[axes + ["gene"]]
 
     # Limits of the full canvas. The `.min()` inside the max() is deliberate
     # (historical quirk): changing it changes every tile, see CLEANUP_PLAN.md §11.
-    x_min, x_max = min((df_cell["X"].min(), df_dots["X"].min())), max(
-        (df_cell["X"].max(), df_dots["X"].min())
-    )
-    y_min, y_max = min((df_cell["Y"].min(), df_dots["Y"].min())), max(
-        (df_cell["Y"].max(), df_dots["Y"].min())
-    )
+    full_region_vxs = ()
+    for axis in axes:
+        full_region_vxs += (min((df_cell[axis].min(), df_dots[axis].min())),
+                            max((df_cell[axis].max(), df_dots[axis].min())))
 
     # filtering cells
     if counts_min_cell >= 0:
@@ -248,12 +223,11 @@ def _graphs_from_tables(
         bool_cells = counts > counts_min_cell
         df_cell = df_cell.loc[bool_cells.cpu().numpy(), :]
 
-    full_region_vxs = x_min, x_max, y_min, y_max
     # create gridpoints
     all_gridpoints, diameter = hex_grid_by_spacing(
         full_region_vxs, grid_spacing, pad_fraction=0.05
     )
-    df_gridpoints = pd.DataFrame(all_gridpoints, columns=["X", "Y"])
+    df_gridpoints = pd.DataFrame(all_gridpoints, columns=axes)
     (
         fovs_vertexes,
         fovs_core_vertexes,
@@ -287,6 +261,8 @@ def _graphs_from_tables(
 
     graphs, region_labels = [], []
     for i in indices:
+        if fovs_gridpoints_df[i].empty:  # a thin border tile without fine gridpoints
+            continue
         graph = build_tile_graph(
             fovs_vertexes[i],
             fovs_core_vertexes[i],
@@ -314,7 +290,7 @@ def _graphs_from_tables(
         graph.unique_cell_ids = fovs_cells_df[i]["unique_cell_id"].values
         graphs.append(graph)
         if region_key is not None:
-            region_labels.append(fovs_cells_df[i][region_key].values)
+            region_labels.append(fovs_cells_df[i]["region"].values)
 
     return graphs, region_labels
 
@@ -339,23 +315,21 @@ def _graphs_from_anndata(
     is given, the per-graph array of raw region labels (else an empty list).
     """
     adata = ad.read_h5ad(path_adata)
+    if region_key is not None:
+        adata.obs["region"] = adata.obs[region_key].values  # before X, Y, Z are written
 
-    try:
-        adata.obs['X'] = adata.obsm['spatial'][:, 0]
-        adata.obs['Y'] = adata.obsm['spatial'][:, 1]
-    except KeyError:
-        adata.obs['X'] = adata.obs['x'].values
-        adata.obs['Y'] = adata.obs['y'].values
+    coordinates = _anndata_coordinates(adata)
+    axes = list(coordinates.columns)
+    for axis in axes:
+        adata.obs[axis] = coordinates[axis].values
     adata.obs['unique_cell_id'] = adata.obs_names
 
     # Limits of the full canvas. The `.min()` inside the max() is deliberate
     # (historical quirk): changing it changes every tile, see CLEANUP_PLAN.md §11.
-    x_min, x_max = min((adata.obs["X"].min(), adata.obs["X"].min())), max(
-        (adata.obs["X"].max(), adata.obs["X"].min())
-    )
-    y_min, y_max = min((adata.obs["Y"].min(), adata.obs["Y"].min())), max(
-        (adata.obs["Y"].max(), adata.obs["Y"].min())
-    )
+    full_region_vxs = ()
+    for axis in axes:
+        full_region_vxs += (min((adata.obs[axis].min(), adata.obs[axis].min())),
+                            max((adata.obs[axis].max(), adata.obs[axis].min())))
 
     # filter cells with less than counts_min_cell counts
     if counts_min_cell >= 0:
@@ -367,14 +341,13 @@ def _graphs_from_anndata(
         raise ValueError(f"{path_adata} lacks reference genes {missing[:10]}")
     adata = adata[:, genes]
 
-    columns = ["X", "Y", "unique_cell_id"] + ([region_key] if region_key is not None else [])
+    columns = axes + ["unique_cell_id"] + (["region"] if region_key is not None else [])
     df_cell = adata.obs[columns].copy()
-    full_region_vxs = x_min, x_max, y_min, y_max
     # create gridpoints
     all_gridpoints, diameter = hex_grid_by_spacing(
         full_region_vxs, grid_spacing, pad_fraction=0.05
     )
-    df_gridpoints = pd.DataFrame(all_gridpoints, columns=["X", "Y"])
+    df_gridpoints = pd.DataFrame(all_gridpoints, columns=axes)
 
     X = adata.X
     if issparse(X):
@@ -407,6 +380,8 @@ def _graphs_from_anndata(
 
     graphs, region_labels = [], []
     for i in indices:
+        if fovs_gridpoints_df[i].empty:  # a thin border tile without fine gridpoints
+            continue
         graph = build_tile_graph(
             fovs_vertexes[i],
             fovs_core_vertexes[i],
@@ -431,7 +406,7 @@ def _graphs_from_anndata(
         graph.unique_cell_ids = fovs_cells_df[i]["unique_cell_id"].values
         graphs.append(graph)
         if region_key is not None:
-            region_labels.append(fovs_cells_df[i][region_key].values)
+            region_labels.append(fovs_cells_df[i]["region"].values)
 
     return graphs, region_labels
 
@@ -476,21 +451,24 @@ def _region_one_hot(as_str, annotated, regions):
 def _section_summary(spatial_path, genes, max_cells=20_000):
     """Cell coordinates of one section, and its transcripts on ``genes`` (all genes if None).
 
-    Returns ``(xy, n_transcripts, n_counted_cells)``; the transcripts are counted on
-    the first ``max_cells`` cells only, which is enough for a mean per cell.
+    Returns ``(xyz, n_transcripts, n_counted_cells)`` (``xyz`` has 2 or 3 columns, see
+    ``_axes``); the transcripts are counted on the first ``max_cells`` cells only,
+    which is enough for a mean per cell.
     """
     if isinstance(spatial_path, (tuple, list)):
         dots, cells = _read_dots(spatial_path[0]), pd.read_csv(spatial_path[1])
-        xy = cells[["X", "Y"] if "X" in cells.columns else ["x", "y"]].to_numpy(dtype=float)
+        if "X" not in cells.columns:
+            cells = cells.rename(columns={"x": "X", "y": "Y", "z": "Z"})
+        xyz = cells[_axes(cells)].to_numpy(dtype=float)
         n_transcripts = len(dots) if genes is None else int(dots["gene"].isin(genes).sum())
-        return xy, n_transcripts, len(cells)
+        return xyz, n_transcripts, len(cells)
     adata = ad.read_h5ad(spatial_path, backed="r")
-    xy = np.asarray(adata.obsm["spatial"])[:, :2] if "spatial" in adata.obsm else adata.obs[["x", "y"]].to_numpy()
+    xyz = _anndata_coordinates(adata).to_numpy(dtype=float)
     X = adata.X[:max_cells]
     if genes is not None:
         X = X[:, adata.var_names.get_indexer([g for g in genes if g in adata.var_names])]
     adata.file.close()
-    return np.asarray(xy, dtype=float), float(X.sum()), X.shape[0]
+    return xyz, float(X.sum()), X.shape[0]
 
 
 def auto_graph_parameters(spatial_paths, genes=None, max_cells_per_graph=100_000):
@@ -501,7 +479,8 @@ def auto_graph_parameters(spatial_paths, genes=None, max_cells_per_graph=100_000
     ``max_cells_per_graph`` cells, in which case it is cut into square tiles
     that stay below ``max_cells_per_graph`` cells (frames included) even in
     the densest tenth of the section, with ``fraction_overlap`` 0.1 (0
-    otherwise). Shared by all sections:
+    otherwise). In 3D, tiles are cubes and a single tile also covers the z
+    extent. Shared by all sections:
     distances scale with ``d_nn``, the median distance from a cell to its
     closest neighbour (median over the sections); cell-cell edges reach
     ``cell_cell_maxdist = 20 d_nn`` and fine gridpoints sit ``grid_spacing =
@@ -514,17 +493,18 @@ def auto_graph_parameters(spatial_paths, genes=None, max_cells_per_graph=100_000
         spatial_paths = [spatial_paths]
     d_nn, tile_side, fraction_overlap, n_transcripts, n_counted = [], [], [], 0.0, 0
     for path in spatial_paths:
-        xy, transcripts, counted = _section_summary(path, genes)
-        d_nn.append(np.median(KDTree(xy).query(xy, k=2)[0][:, 1]))
-        width, height = float(np.ptp(xy[:, 0])), float(np.ptp(xy[:, 1]))
-        if len(xy) <= max_cells_per_graph:
+        xyz, transcripts, counted = _section_summary(path, genes)
+        d_nn.append(np.median(KDTree(xyz).query(xyz, k=2)[0][:, 1]))
+        extent = np.ptp(xyz, axis=0)
+        if len(xyz) <= max_cells_per_graph:
             # one tile: the canvas is padded to 1.1 x extent, a hair more so ceil() adds no empty tile
-            tile_side.append(1.12 * max(width, height))
+            tile_side.append(1.12 * float(extent.max()))
             fraction_overlap.append(0.0)
         else:
             # square tiles that stay below max_cells_per_graph cells (10 % frames included)
             # even in the densest part of the section, the busiest of 10 x 10 bins
-            bins, _, _ = np.histogram2d(xy[:, 0], xy[:, 1], bins=10)
+            width, height = float(extent[0]), float(extent[1])
+            bins, _, _ = np.histogram2d(xyz[:, 0], xyz[:, 1], bins=10)
             density = bins.max() / (width * height / 100)
             tile_side.append(math.sqrt(max_cells_per_graph / density) / 1.2)
             fraction_overlap.append(0.1)
@@ -571,8 +551,9 @@ def generate_graphs(
     Parameters
     ----------
     spatial_paths : list
-        .h5ad paths (cells x genes counts, coordinates in ``obsm["spatial"]`` or
-        ``obs["x"/"y"]``), or (dots csv, cells csv) tuples.
+        .h5ad paths (cells x genes counts, 2 or 3 coordinates in ``obsm["spatial"]``
+        or ``obs["x"/"y"/"z"]``), or (dots csv, cells csv) tuples (x, y[, z]).
+        A constant z is ignored (2D section); 2D and 3D sections cannot be mixed.
     reference : DataFrame | csv path | AnnData | .h5ad path
         Cell types x genes reference (AnnData needs ``reference_key``).
     reference_key : str or None
@@ -590,6 +571,7 @@ def generate_graphs(
         ``tile_side`` and ``fraction_overlap`` may also be lists with one
         entry per spatial path (which is what "auto" produces: one graph per
         section, only sections above 100 000 cells are cut into tiles).
+        Tiles are cubes for 3D sections.
     min_cells, min_dots, cell_cell_k_neighbors, counts_min_cell, coarse_grid_side, device
         Remaining tiling and topology parameters. Dots path: ``min_dots``
         currently has no effect and ``cell_cell_maxdist`` is fixed at 90
@@ -647,6 +629,10 @@ def generate_graphs(
             section_label = os.path.basename(path)
         if not tiles:
             warnings.warn(f"{section_label}: no tile passed the filters (min_cells={min_cells})")
+        elif graphs and len(tiles[0].vertexes_fov) != len(graphs[0].vertexes_fov):
+            raise ValueError(f"{section_label} is {len(tiles[0].vertexes_fov) // 2}D but "
+                             f"{graphs[0].section_label} is {len(graphs[0].vertexes_fov) // 2}D: "
+                             "2D and 3D sections cannot be mixed")
         for graph in tiles:
             graph.section_label = section_label
             graph.section = i

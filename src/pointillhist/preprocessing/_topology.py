@@ -20,6 +20,13 @@ def one_hot_encode_genes(dots_df, genes):
     one_hots = dots_df["gene"].values[:, None] == np.asarray(genes)
     return one_hots.astype(int)
 
+def _coords(df):
+    """(n, 2) or (n, 3) array of the x, y[, z] (or X, Y[, Z]) columns of ``df``."""
+    for names in (["x", "y", "z"], ["X", "Y", "Z"]):
+        if names[0] in df.columns:
+            return df[[name for name in names if name in df.columns]].values
+    raise ValueError("Coordinates not found in dataframe.")
+
 def knn_edges(
     cell_centroid_df,
     strategy="knn",
@@ -34,7 +41,7 @@ def knn_edges(
     Parameters
     ----------
     cell_centroid_df : pd.DataFrame
-        DataFrame with cell coordinates (x/y or X/Y).
+        DataFrame with cell coordinates (x/y[/z] or X/Y[/Z]).
     strategy : str
         One of ['knn', 'ball', 'knn-maxdist', 'ball-kmax'].
     self_edges : bool
@@ -53,12 +60,7 @@ def knn_edges(
     edge_index : np.ndarray
         Array of shape (2, n_edges).
     """
-    if "x" in cell_centroid_df.columns:
-        coords = cell_centroid_df[["x", "y"]].values
-    elif "X" in cell_centroid_df.columns:
-        coords = cell_centroid_df[["X", "Y"]].values
-    else:
-        raise ValueError("Coordinates not found in dataframe.")
+    coords = _coords(cell_centroid_df)
 
     N = coords.shape[0]
 
@@ -144,16 +146,10 @@ def assignment_edges(
     edge_index : np.ndarray of shape (2, num_edges)
     edge_weight : np.ndarray or None (if enabled)
     """
-    if "x" in dots_df.columns:
-        dot_coords = dots_df[["x", "y"]].values
-    elif "X" in dots_df.columns:
-        dot_coords = dots_df[["X", "Y"]].values
+    dot_coords = _coords(dots_df)
 
     if cell_centroid_df is not None:
-        if "x" in cell_centroid_df.columns:
-            cell_coords = cell_centroid_df[["x", "y"]].values
-        elif "X" in cell_centroid_df.columns:
-            cell_coords = cell_centroid_df[["X", "Y"]].values
+        cell_coords = _coords(cell_centroid_df)
     else:
         raise ValueError("`cell_centroid_df` must be provided.")
 
@@ -243,11 +239,12 @@ def cell_to_grid_edges(grid_df, cell_centroid_df, radius=100):
 def hex_grid_by_count(vertexes, N=25):
     """Note this is a triangular/hexagonal grid
     where each point is equidistand from its 6 neighbors
+    (a cubic lattice for 3D vertexes)
 
     Parameters
     ----------
     vertexes : tuple
-        The tuple containing the vertexes of the field of view.
+        (x_min, x_max, y_min, y_max[, z_min, z_max]) of the field of view.
     N : int, default=25
         The number of gridpoints to generate.
         Note that this is an approximate number because the grid is hexagonal
@@ -258,6 +255,12 @@ def hex_grid_by_count(vertexes, N=25):
     points : np.array
         The array containing the gridpoints.
     """
+    if len(vertexes) == 6:
+        low, high = np.array(vertexes[::2]), np.array(vertexes[1::2])
+        spacing = (high[0] - low[0]) / int(round(N ** (1 / 3)))
+        axes = [np.arange(lo, hi, spacing) for lo, hi in zip(low, high)]
+        points = np.stack(np.meshgrid(*axes, indexing="ij"), axis=-1).reshape(-1, 3)
+        return points[(points < high).all(axis=1)], 2 * spacing
     n = int(np.sqrt(N))
     x_min, x_max, y_min, y_max = vertexes
     spacing = (x_max - x_min) / n
@@ -277,11 +280,12 @@ def hex_grid_by_spacing(
 ):
     """Note this is a triangular/hexagonal grid
     where each point is equidistand from its 6 neighbors
+    (a cubic lattice for 3D vertexes)
 
     Parameters
     ----------
     vertexes : tuple
-        The tuple containing the vertexes of the field of view.
+        (x_min, x_max, y_min, y_max[, z_min, z_max]) of the field of view.
     spacing : int, default=150
         The typical spacing between the gridpoints in pixels.
 
@@ -290,6 +294,16 @@ def hex_grid_by_spacing(
     points : np.array
         The array containing the gridpoints.
     """
+    if len(vertexes) == 6:
+        low, high = np.array(vertexes[::2]), np.array(vertexes[1::2])
+        low, high = low - pad_fraction * (high - low), high + pad_fraction * (high - low)
+        spacing = float(spacing)
+        axes = [np.arange(float(lo), float(hi) + spacing, spacing) + offset_fraction * spacing
+                for lo, hi in zip(low, high)]
+        points = np.stack(np.meshgrid(*axes, indexing="ij"), axis=-1).reshape(-1, 3)
+        # a thin axis (e.g. z of a single slice) keeps its first layer
+        high = np.maximum(high, low.astype(float) + offset_fraction * spacing)
+        return points[(points <= high).all(axis=1)], 2 * spacing
 
     x_min, x_max, y_min, y_max = vertexes
     full_range_x = x_max - x_min
@@ -343,17 +357,17 @@ def build_tile_graph(
     Parameters
     ----------
     vertexes_fov, core_vertexes_fov : tuple
-        (x_min, x_max, y_min, y_max) of the tile and of its core.
+        (x_min, x_max, y_min, y_max[, z_min, z_max]) of the tile and of its core.
     df_cells_fov : pd.DataFrame
-        Cells of the tile (X, Y, is_core).
+        Cells of the tile (X, Y[, Z], is_core).
     df_gridpoints_fov : pd.DataFrame
-        Gridpoints of the tile (X, Y, is_core).
+        Gridpoints of the tile (X, Y[, Z], is_core).
     genes : list
-        Gene order of the dot one-hot (dots path).
+        Gene order of the dot one-hot, or of the first counts columns.
     df_dots_fov : pd.DataFrame or None
-        Dots of the tile (X, Y, gene, is_core); dots path only.
+        Dots of the tile (X, Y[, Z], gene, is_core); dots path only.
     df_cells_features_fov : pd.DataFrame or None
-        Per-cell counts (genes..., X, Y, is_core); AnnData path only.
+        Per-cell counts (genes..., X, Y[, Z], is_core); AnnData path only.
     grid_triangle_side : float
         Side of the hexagonal grid triangles, sets the cell -> gridpoint radius.
     cell_cell_strategy, cell_cell_k_neighbors, cell_cell_maxdist
@@ -365,7 +379,7 @@ def build_tile_graph(
     use_stored_cell_assign : bool
         Use the ``cell`` column of the dots as the dot-cell assignment.
     coarse_grid_side : int
-        Side of the coarse (long-range) grid; 0 disables it.
+        Side of the coarse (long-range) grid (cubed in 3D); 0 disables it.
 
     Returns
     -------
@@ -381,7 +395,7 @@ def build_tile_graph(
     if df_dots_fov is not None:
         one_hot = one_hot_encode_genes(df_dots_fov, genes)
 
-        dots_pos = df_dots_fov[["X", "Y"]].values
+        dots_pos = _coords(df_dots_fov)
         if pos_is_separate:
             dots_node_features = one_hot.astype(np.float32)
         else:
@@ -419,9 +433,10 @@ def build_tile_graph(
 
     if coarse_grid_side > 0:
         # 1. Generate the grid points for this tile using the vertexes
-        # We use N = M^2 to get an MxM grid
-        lr_points, lr_diameter = hex_grid_by_count(vertexes_fov, N=coarse_grid_side**2)
-        df_lr_grid = pd.DataFrame(lr_points, columns=["X", "Y"])
+        # We use N = M^2 to get an MxM grid (N = M^3 for a 3D tile)
+        n_coarse = coarse_grid_side ** (len(vertexes_fov) // 2)
+        lr_points, lr_diameter = hex_grid_by_count(vertexes_fov, N=n_coarse)
+        df_lr_grid = pd.DataFrame(lr_points, columns=["X", "Y", "Z"][:lr_points.shape[1]])
 
         # 2. Make Grid-Grid edges (Hexagonal approach, same as regular grid)
         # Using simple KNN with k=6 creates the hexagonal lattice topology
@@ -444,7 +459,7 @@ def build_tile_graph(
     if pos_is_separate:
         
         if df_cells_features_fov is not None:
-            gene_expression = df_cells_features_fov.values[:, :-3].astype(np.float32)
+            gene_expression = df_cells_features_fov.values[:, :len(genes)].astype(np.float32)
             data["cells"].x = torch.tensor(gene_expression, dtype=torch.float)
             # @TODO .x as the gene expression? 
             data["cells"].pos = torch.tensor(cells_node_features, dtype=torch.float)
