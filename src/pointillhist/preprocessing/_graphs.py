@@ -485,15 +485,18 @@ def auto_graph_parameters(spatial_paths, genes=None, max_cells_per_graph=100_000
     closest neighbour (median over the sections); cell-cell edges reach
     ``cell_cell_maxdist = 20 d_nn`` and fine gridpoints sit ``grid_spacing =
     10 d_nn`` apart, which puts a few dozen cells within a gridpoint's reach at
-    uniform density. Sparse data needs more cells per gridpoint for a stable
+    uniform density (``5 d_nn`` in 3D, where the reach is a sphere: about a
+    hundred cells). Sparse data needs more cells per gridpoint for a stable
     composition, so below 50 transcripts per cell (counted on ``genes``, the
     reference panel) the spacing grows as sqrt(50 / transcripts per cell).
     """
     if isinstance(spatial_paths, (str, tuple)):
         spatial_paths = [spatial_paths]
     d_nn, tile_side, fraction_overlap, n_transcripts, n_counted = [], [], [], 0.0, 0
+    is_3d = False
     for path in spatial_paths:
         xyz, transcripts, counted = _section_summary(path, genes)
+        is_3d = is_3d or xyz.shape[1] == 3
         d_nn.append(np.median(KDTree(xyz).query(xyz, k=2)[0][:, 1]))
         extent = np.ptp(xyz, axis=0)
         if len(xyz) <= max_cells_per_graph:
@@ -512,9 +515,11 @@ def auto_graph_parameters(spatial_paths, genes=None, max_cells_per_graph=100_000
         n_counted += counted
     d_nn = float(np.median(d_nn))
     transcripts_per_cell = n_transcripts / n_counted
+    # 10 d_nn would put about 800 cells within the spherical reach of a 3D gridpoint
+    grid_factor = 5 if is_3d else 10
     return dict(
         tile_side=tile_side,
-        grid_spacing=10 * d_nn * math.sqrt(max(1.0, 50.0 / transcripts_per_cell)),
+        grid_spacing=grid_factor * d_nn * math.sqrt(max(1.0, 50.0 / transcripts_per_cell)),
         cell_cell_maxdist=20 * d_nn,
         fraction_overlap=fraction_overlap,
     )
