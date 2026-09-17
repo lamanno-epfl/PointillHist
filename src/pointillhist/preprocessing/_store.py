@@ -204,12 +204,34 @@ class _GraphWriter:
         os.makedirs(os.path.join(path, GRAPH_DIR), exist_ok=True)
         self.path = path
         self.token = uuid.uuid4().hex
+        self._start()
+
+    def _start(self):
         self.rows = []
         self.shared = {}
         self.tiles = {}
         self.region_vocabulary = set()
         self.streamed_regions = False
         self.closed = False
+        self.owns_all = False   # abort removes every graph file (other processes wrote some)
+
+    @classmethod
+    def attached(cls, path, token, shared):
+        """A writer in another process, adding graphs to a folder that a main writer created."""
+        writer = cls.__new__(cls)
+        writer.path, writer.token, writer.created = path, token, False
+        writer._start()
+        writer.shared = copy.deepcopy(shared)
+        return writer
+
+    def merge(self, rows, region_vocabulary, streamed_regions, shared):
+        """Take over the graphs an attached writer wrote (in the order they must have in the index)."""
+        if rows and not self.rows:
+            for name, value in shared.items():
+                self.shared.setdefault(name, copy.deepcopy(value))
+        self.rows.extend(rows)
+        self.region_vocabulary.update(region_vocabulary)
+        self.streamed_regions = self.streamed_regions or streamed_regions
 
     def __enter__(self):
         return self
@@ -219,15 +241,18 @@ class _GraphWriter:
             self.abort()
         return False
 
-    def abort(self):
-        """Remove what this writer wrote (graph files, temporary files, folders it created)."""
+    def abort(self, remove_folders=True):
+        """Remove what this writer wrote (graph files, temporary files, folders it created); with
+        ``owns_all``, every file of the graph folder, which was empty when the writer started."""
         graph_dir = os.path.join(self.path, GRAPH_DIR)
         for row in self.rows:
             _remove(os.path.join(graph_dir, row["file"]))
         for name in os.listdir(graph_dir) if os.path.isdir(graph_dir) else []:
-            if f".pt.tmp{os.getpid()}" in name:
+            if self.owns_all or f".pt.tmp{os.getpid()}" in name:
                 _remove(os.path.join(graph_dir, name))
         _remove(os.path.join(self.path, f"{INDEX_FILE}.tmp{os.getpid()}"))
+        if not remove_folders:
+            return
         for folder in (graph_dir, self.path) if self.created else (graph_dir,):
             try:
                 os.rmdir(folder)

@@ -1,6 +1,12 @@
 import itertools
 import math
 import os
+import pickle
+import shutil
+import subprocess
+import sys
+import tempfile
+import time
 import warnings
 
 import anndata as ad
@@ -552,6 +558,7 @@ def generate_graphs(
     coarse_grid_side=7,
     device="cpu",
     save_dir=None,
+    n_workers=1,
 ):
     """Tile every spatial section into HeteroData graphs.
 
@@ -592,6 +599,10 @@ def generate_graphs(
         :class:`DiskGraphs`, which loads each graph (on the CPU) when it is
         accessed. The graphs are the same in both cases. If building fails,
         what was written is removed again.
+    n_workers : int
+        With ``save_dir``, the number of sections built at the same time,
+        each in its own Python process (on the CPU, so memory holds up to
+        ``n_workers`` sections); the graphs are the same as with 1 (default).
 
     Returns
     -------
@@ -602,6 +613,11 @@ def generate_graphs(
     """
     if len(spatial_paths) == 0:
         raise ValueError("spatial_paths is empty")
+    if isinstance(n_workers, (bool, np.bool_)) or not isinstance(n_workers, (int, np.integer)) or n_workers < 1:
+        raise ValueError(f"n_workers must be a positive integer, got {n_workers!r}")
+    if n_workers > 1 and save_dir is None:
+        raise ValueError("n_workers > 1 needs save_dir: sections are built in parallel only when the graphs "
+                         "are written to disk")
     reference = load_reference(reference, reference_key)
     cell_types = list(reference.index)
     n_files = len(spatial_paths)
@@ -625,19 +641,22 @@ def generate_graphs(
     if grid_spacing >= min(tile_sides):
         raise ValueError(f"grid_spacing ({grid_spacing:.3g}) must be smaller than tile_side ({min(tile_sides):.3g})")
 
+    settings = dict(genes=genes, region_key=region_key, tile_sides=tile_sides, overlaps=overlaps,
+                    min_cells=min_cells, min_dots=min_dots, cell_cell_k_neighbors=cell_cell_k_neighbors,
+                    cell_cell_maxdist=cell_cell_maxdist, grid_spacing=grid_spacing,
+                    counts_min_cell=counts_min_cell, device=device, coarse_grid_side=coarse_grid_side,
+                    timepoint_labels=timepoint_labels, timepoint_codes=timepoint_codes,
+                    condition_labels=condition_labels, condition_codes=condition_codes, cell_types=cell_types)
     if save_dir is not None:
         with _GraphWriter(save_dir) as writer:   # an error removes what was written
-            _build_graphs(spatial_paths, genes, region_key, tile_sides, overlaps, min_cells, min_dots,
-                          cell_cell_k_neighbors, cell_cell_maxdist, grid_spacing, counts_min_cell, device,
-                          coarse_grid_side, timepoint_labels, timepoint_codes, condition_labels, condition_codes,
-                          cell_types, writer)
+            if n_workers > 1:
+                _build_graphs_parallel(spatial_paths, settings, writer, n_workers)
+            else:
+                _build_graphs(spatial_paths, settings, writer)
             if region_key is not None and not writer.region_vocabulary:
                 raise ValueError(f"no annotated cells found in column {region_key!r}")
             return writer.close()
-    graphs, region_labels = _build_graphs(
-        spatial_paths, genes, region_key, tile_sides, overlaps, min_cells, min_dots, cell_cell_k_neighbors,
-        cell_cell_maxdist, grid_spacing, counts_min_cell, device, coarse_grid_side, timepoint_labels,
-        timepoint_codes, condition_labels, condition_codes, cell_types)
+    graphs, region_labels = _build_graphs(spatial_paths, settings)
 
     if region_key is not None:
         region_labels = [_region_strings(labels) for labels in region_labels]
@@ -651,53 +670,148 @@ def generate_graphs(
     return graphs
 
 
-def _build_graphs(spatial_paths, genes, region_key, tile_sides, overlaps, min_cells, min_dots,
-                  cell_cell_k_neighbors, cell_cell_maxdist, grid_spacing, counts_min_cell, device,
-                  coarse_grid_side, timepoint_labels, timepoint_codes, condition_labels, condition_codes,
-                  cell_types, writer=None):
+def _section_settings(settings, i):
+    """The arguments of _section_tiles for section ``i``."""
+    return dict(
+        genes=settings["genes"], region_key=settings["region_key"], tile_side=settings["tile_sides"][i],
+        overlap=settings["overlaps"][i], min_cells=settings["min_cells"], min_dots=settings["min_dots"],
+        cell_cell_k_neighbors=settings["cell_cell_k_neighbors"], cell_cell_maxdist=settings["cell_cell_maxdist"],
+        grid_spacing=settings["grid_spacing"], counts_min_cell=settings["counts_min_cell"],
+        device=settings["device"], coarse_grid_side=settings["coarse_grid_side"],
+        timepoint_label=settings["timepoint_labels"][i], timepoint_code=int(settings["timepoint_codes"][i]),
+        condition_label=settings["condition_labels"][i], condition_code=int(settings["condition_codes"][i]),
+        cell_types=settings["cell_types"],
+    )
+
+
+def _section_tiles(i, path, genes, region_key, tile_side, overlap, min_cells, min_dots, cell_cell_k_neighbors,
+                   cell_cell_maxdist, grid_spacing, counts_min_cell, device, coarse_grid_side, timepoint_label,
+                   timepoint_code, condition_label, condition_code, cell_types):
+    """The graphs of section ``i`` with their section, timepoint and condition attributes, the raw
+    region labels of each graph, and the section label."""
+    if isinstance(path, (tuple, list)):
+        tiles, labels = _graphs_from_tables(
+            path[0], path[1], genes, region_key,
+            tile_side=tile_side, min_cells=min_cells, min_dots=min_dots,
+            cell_cell_k_neighbors=cell_cell_k_neighbors, grid_spacing=grid_spacing,
+            fraction_overlap=overlap, counts_min_cell=counts_min_cell,
+            device=device, coarse_grid_side=coarse_grid_side)
+        section_label = os.path.basename(path[1])
+    else:
+        tiles, labels = _graphs_from_anndata(
+            path, genes, region_key,
+            tile_side=tile_side, min_cells=min_cells,
+            cell_cell_k_neighbors=cell_cell_k_neighbors, cell_cell_maxdist=cell_cell_maxdist,
+            grid_spacing=grid_spacing, fraction_overlap=overlap,
+            counts_min_cell=counts_min_cell, device=device, coarse_grid_side=coarse_grid_side)
+        section_label = os.path.basename(path)
+    for graph in tiles:
+        graph.section_label = section_label
+        graph.section = i
+        graph.timepoint_label = timepoint_label
+        graph.timepoint = timepoint_code
+        graph.condition_label = condition_label
+        graph.condition = condition_code
+        graph.cell_types = cell_types
+        graph.genes = genes
+    return tiles, labels, section_label
+
+
+def _check_dimensions(n_vertexes, section_label, first, min_cells):
+    """2D/3D bookkeeping for a section whose graphs have ``n_vertexes`` vertex coordinates (None: no graph).
+    ``first`` is (n_vertexes, section_label) of the first section with graphs; returns it."""
+    if n_vertexes is None:
+        warnings.warn(f"{section_label}: no tile passed the filters (min_cells={min_cells})")
+    elif first is None:
+        first = (n_vertexes, section_label)
+    elif n_vertexes != first[0]:
+        raise ValueError(f"{section_label} is {n_vertexes // 2}D but "
+                         f"{first[1]} is {first[0] // 2}D: "
+                         "2D and 3D sections cannot be mixed")
+    return first
+
+
+def _build_graphs(spatial_paths, settings, writer=None):
     """The section loop of generate_graphs: the graphs and raw region labels of every section, or,
     with a writer, each section's graphs written as soon as they are built (nothing returned)."""
     graphs, region_labels = [], []
     first = None   # (len(vertexes_fov), section_label) of the first graph, for the 2D/3D check
     for i, path in enumerate(tqdm.tqdm(spatial_paths, desc="Generating graphs")):
-        if isinstance(path, (tuple, list)):
-            tiles, labels = _graphs_from_tables(
-                path[0], path[1], genes, region_key,
-                tile_side=tile_sides[i], min_cells=min_cells, min_dots=min_dots,
-                cell_cell_k_neighbors=cell_cell_k_neighbors, grid_spacing=grid_spacing,
-                fraction_overlap=overlaps[i], counts_min_cell=counts_min_cell,
-                device=device, coarse_grid_side=coarse_grid_side)
-            section_label = os.path.basename(path[1])
-        else:
-            tiles, labels = _graphs_from_anndata(
-                path, genes, region_key,
-                tile_side=tile_sides[i], min_cells=min_cells,
-                cell_cell_k_neighbors=cell_cell_k_neighbors, cell_cell_maxdist=cell_cell_maxdist,
-                grid_spacing=grid_spacing, fraction_overlap=overlaps[i],
-                counts_min_cell=counts_min_cell, device=device, coarse_grid_side=coarse_grid_side)
-            section_label = os.path.basename(path)
-        if not tiles:
-            warnings.warn(f"{section_label}: no tile passed the filters (min_cells={min_cells})")
-        elif first is None:
-            first = (len(tiles[0].vertexes_fov), section_label)
-        elif len(tiles[0].vertexes_fov) != first[0]:
-            raise ValueError(f"{section_label} is {len(tiles[0].vertexes_fov) // 2}D but "
-                             f"{first[1]} is {first[0] // 2}D: "
-                             "2D and 3D sections cannot be mixed")
-        for graph in tiles:
-            graph.section_label = section_label
-            graph.section = i
-            graph.timepoint_label = timepoint_labels[i]
-            graph.timepoint = int(timepoint_codes[i])
-            graph.condition_label = condition_labels[i]
-            graph.condition = int(condition_codes[i])
-            graph.cell_types = cell_types
-            graph.genes = genes
+        tiles, labels, section_label = _section_tiles(i, path, **_section_settings(settings, i))
+        first = _check_dimensions(len(tiles[0].vertexes_fov) if tiles else None, section_label, first,
+                                  settings["min_cells"])
         if writer is None:
             graphs += tiles
             region_labels += labels
         else:
             for j, graph in enumerate(tiles):
-                writer.add(graph, _region_strings(labels[j]) if region_key is not None else None)
+                writer.add(graph, _region_strings(labels[j]) if settings["region_key"] is not None else None)
             tiles = labels = graph = None   # only one section in memory
     return graphs, region_labels
+
+
+def _write_section(folder, token, shared, i, path, threads, section):
+    """Build section ``i`` and write its graphs into ``folder`` (run by _graph_worker in its own process)."""
+    torch.set_num_threads(threads)
+    tiles, labels, section_label = _section_tiles(i, path, **section)
+    writer = _GraphWriter.attached(folder, token, shared)
+    try:
+        for j, graph in enumerate(tiles):
+            writer.add(graph, _region_strings(labels[j]) if section["region_key"] is not None else None)
+    except BaseException:
+        writer.abort(remove_folders=False)
+        raise
+    return dict(section_label=section_label, n_vertexes=len(tiles[0].vertexes_fov) if tiles else None,
+                rows=writer.rows, region_vocabulary=writer.region_vocabulary, streamed=writer.streamed_regions)
+
+
+def _build_graphs_parallel(spatial_paths, settings, writer, n_workers):
+    """_build_graphs with a writer, ``n_workers`` sections at a time, each in its own Python process."""
+    shared = {"cell_types": settings["cell_types"], "genes": settings["genes"]}
+    writer.owns_all = True   # an error removes every graph file, whichever process wrote it
+    threads = max(1, (os.cpu_count() or 1) // n_workers)
+    env = dict(os.environ, PYTHONPATH=os.pathsep.join(p or os.getcwd() for p in sys.path))
+    env.setdefault("OMP_NUM_THREADS", str(threads))
+    module = __name__.rsplit(".", 1)[0] + "._graph_worker"
+    scratch = tempfile.mkdtemp(prefix="pointillhist_sections_")
+    results = [None] * len(spatial_paths)
+    pending, running = list(range(len(spatial_paths))), {}
+    bar = tqdm.tqdm(total=len(spatial_paths), desc="Generating graphs")
+    try:
+        while pending or running:
+            while pending and len(running) < n_workers:
+                i = pending.pop(0)
+                task, result = os.path.join(scratch, f"task{i}.pkl"), os.path.join(scratch, f"result{i}.pkl")
+                section = dict(_section_settings(settings, i), device="cpu")
+                with open(task, "wb") as handle:
+                    pickle.dump(dict(folder=writer.path, token=writer.token, shared=shared, i=i,
+                                     path=spatial_paths[i], threads=threads, section=section), handle)
+                running[i] = (subprocess.Popen([sys.executable, "-m", module, task, result], env=env), result)
+            finished = [i for i, (process, _) in running.items() if process.poll() is not None]
+            if not finished:
+                time.sleep(0.1)
+            for i in finished:
+                process, result = running.pop(i)
+                if not os.path.exists(result):
+                    raise RuntimeError(f"the process building {spatial_paths[i]} stopped with exit code "
+                                       f"{process.returncode}")
+                with open(result, "rb") as handle:
+                    outcome = pickle.load(handle)
+                if "error" in outcome:
+                    sys.stderr.write(f"building {spatial_paths[i]} failed:\n{outcome['traceback']}")
+                    raise outcome["error"]
+                results[i] = outcome
+                bar.update(1)
+    except BaseException:
+        for process, _ in running.values():
+            process.terminate()
+        for process, _ in running.values():
+            process.wait()
+        raise
+    finally:
+        bar.close()
+        shutil.rmtree(scratch, ignore_errors=True)
+    first = None
+    for outcome in results:   # in section order, as _build_graphs
+        first = _check_dimensions(outcome["n_vertexes"], outcome["section_label"], first, settings["min_cells"])
+        writer.merge(outcome["rows"], outcome["region_vocabulary"], outcome["streamed"], shared)
