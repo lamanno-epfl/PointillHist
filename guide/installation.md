@@ -7,9 +7,10 @@ PointillHist is a pure-Python package for Python 3.10 or later. Its dependencies
 GPUs; training on the CPU works but is slow. The supported version ranges, the tested
 environments and the platform notes are in [`docs/environment.md`](../docs/environment.md).
 
-Two extras exist: `umap` adds `umap-learn` for `ph.eval.umap`, and `examples` adds
+Three extras exist: `umap` adds `umap-learn` for `ph.eval.umap`, `parquet` adds `pyarrow`,
+which `ph.eval.predict(..., out=...)` needs to write predictions to disk, and `examples` adds
 `ipykernel`, to run the example notebooks, and `openpyxl`, which the ABCA-2 example needs to
-read its taxonomy from an Excel sheet. Add them as `pointillhist[umap,examples]` in the
+read its taxonomy from an Excel sheet. Add them as `pointillhist[umap,parquet,examples]` in the
 commands below, or leave them out.
 
 ## With pip
@@ -17,7 +18,7 @@ commands below, or leave them out.
 Into an existing environment that has `git` on its PATH:
 
 ```bash
-pip install "pointillhist[umap,examples] @ git+https://github.com/lamanno-epfl/PointillHist.git"
+pip install "pointillhist[umap,parquet,examples] @ git+https://github.com/lamanno-epfl/PointillHist.git"
 ```
 
 On Linux the `torch` wheel from PyPI includes CUDA; see [Choosing the torch build](#choosing-the-torch-build)
@@ -39,7 +40,7 @@ internal tests on all three. It pins the CUDA 13 build of `torch`; for another b
 either skip the lock, in a plain virtual environment from the same clone,
 
 ```bash
-uv venv && uv pip install --torch-backend=auto -e ".[umap,examples]"   # auto: match the NVIDIA driver; or cpu
+uv venv && uv pip install --torch-backend=auto -e ".[umap,parquet,examples]"   # auto: match the NVIDIA driver; or cpu
 ```
 
 or, after `uv sync`, swap `torch` with `uv pip install --reinstall-package torch --torch-backend=auto torch`
@@ -55,7 +56,7 @@ the ones we test.
 ```bash
 conda create -n pointillhist python=3.11 git
 conda activate pointillhist
-pip install "pointillhist[umap,examples] @ git+https://github.com/lamanno-epfl/PointillHist.git"
+pip install "pointillhist[umap,parquet,examples] @ git+https://github.com/lamanno-epfl/PointillHist.git"
 ```
 
 ## Choosing the torch build
