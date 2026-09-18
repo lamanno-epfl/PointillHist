@@ -15,6 +15,7 @@ __all__ = [
     "poisson_cell_loss",
     "gaussian_cell_loss",
     "lognormal_cell_loss",
+    "gamma_cell_loss",
     "total_loss",
 ]
 
@@ -702,6 +703,75 @@ def lognormal_cell_loss(
     return -loglik.mean(dim=1).mean()
 
 
+def gamma_cell_loss(
+    counts,                          # (C, G) strictly positive intensities
+    logits,                          # (C, K)
+    scale,                           # (C, 1) or (C,)
+    reference,                       # (K, G)
+    *,
+    dispersion,                      # (G,) per-gene relative variance phi
+    ambient_logit,                   # scalar (learnable)
+    ambient_profile_logits,          # (G,)  (learnable)
+    temperature=1.0,
+    rho_cap=0.2,                     # cap for the ambient fraction
+    epsilon=1e-8,
+    weight_nnz=3.0,                  # extra weight on non-zeros
+    scale_bound=0.5,                 # m in exp(tanh(scale)*m) -> totals x[e^-m, e^m]
+    gene_detection_bias=None,
+    gene_detection_offset=None,
+):
+    """
+    Gamma likelihood with a per-gene relative variance.
+
+        x_{c,g} ~ Gamma(shape=1 / phi_g, scale=mu_{c,g} * phi_g)
+
+    so E[x] = mu and Var[x] = mu^2 * phi_g: the noise scales with the mean
+    rather than being constant per gene as in :func:`gaussian_cell_loss`. That
+    makes it the continuous counterpart of the negative binomial, for
+    non-negative intensities whose spread grows with their level.
+
+    ``mu`` is built exactly as in :func:`nb_cell_loss`, so it is non-negative
+    and its row sum is anchored to the per-cell total. The density diverges at
+    zero once phi > 1, so zeros are clamped to ``epsilon``; like the log-normal
+    this likelihood only makes sense for strictly positive intensities.
+
+    ``dispersion[g]`` is read as phi_g directly; it is taken in absolute value
+    and floored, as in :func:`gaussian_cell_loss`.
+    """
+    assert counts.dim() == 2, "inputs must be (C,G)"
+    C, G = counts.shape
+    assert logits.size(0) == C, "logits batch size mismatch"
+    assert dispersion.shape == (G,), "dispersion must be (G,)"
+    assert ambient_profile_logits.shape == (G,), "ambient_profile_logits must be (G,)"
+
+    x = counts
+    _, mu = _continuous_rate_and_mu(
+        x, logits, scale, reference, ambient_logit, ambient_profile_logits,
+        gene_detection_bias, gene_detection_offset, temperature, rho_cap, scale_bound,
+    )
+    mu = mu.clamp_min(epsilon)
+
+    phi = dispersion.abs().clamp_min(1e-6).unsqueeze(0)                      # (1,G)
+    alpha = 1.0 / phi                                                        # (1,G) shape
+    theta = (mu * phi).clamp_min(epsilon)                                    # (C,G) scale
+
+    x_clamped = x.clamp_min(epsilon)
+    log_x = torch.log(x_clamped)
+
+    # log Gamma(x | alpha, theta) = (alpha-1) log x - x/theta - lgamma(alpha) - alpha log theta
+    # x_clamped and theta are both >= epsilon, so neither log can see a zero
+    log_gamma = (
+        (alpha - 1.0) * log_x
+        - x_clamped / theta
+        - torch.lgamma(alpha)
+        - alpha * torch.log(theta)
+    )
+
+    is_zero = (x == 0)
+    loglik = torch.where(is_zero, log_gamma, weight_nnz * log_gamma)
+    return -loglik.mean(dim=1).mean()
+
+
 def total_loss(graph,
                lambda_cell_to_grid,
                cell_regions, type_regions,
@@ -853,6 +923,24 @@ def total_loss(graph,
             gene_detection_offset=gene_detection_offset,
         )
 
+    elif cell_loss_type == 'gamma':
+        cell_loss = gamma_cell_loss(
+            counts=counts,
+            logits=logits,
+            scale=scale,
+            reference=reference,
+            dispersion=dispersion,          # (G,) per-gene relative variance phi
+            ambient_logit=ambient_logit,
+            ambient_profile_logits=ambient_profile_logits,
+            temperature=temperature,
+            rho_cap=0.2,
+            epsilon=1e-8,
+            weight_nnz=3.0,
+            scale_bound=0.7,
+            gene_detection_bias=gene_detection_bias,
+            gene_detection_offset=gene_detection_offset,
+        )
+
     elif cell_loss_type == 'poisson':
         cell_loss = poisson_cell_loss(
             counts=counts,
@@ -873,7 +961,7 @@ def total_loss(graph,
     else:
         raise ValueError(
             f"Unknown cell loss type: {cell_loss_type}. Possible values are: "
-            "['zip', 'zinb', 'nb', 'poisson', 'normal', 'log-normal']."
+            "['zip', 'zinb', 'nb', 'poisson', 'normal', 'log-normal', 'gamma']."
         )
 
     # Anatomical loss (only when the annotation matrices are provided)

@@ -13,6 +13,7 @@ __all__ = [
     "estimate_initial_dispersions",
     "estimate_initial_dispersions_normal",
     "estimate_initial_dispersions_lognormal",
+    "estimate_initial_dispersions_gamma",
 ]
 
 DIST_SCALER_EDGE_TYPES = {
@@ -165,6 +166,26 @@ def estimate_initial_dispersions_lognormal(
     return sigma.to(device)
 
 
+def estimate_initial_dispersions_gamma(
+    graphs: list,
+    device: torch.device,
+    min_phi: float = 1e-3,
+) -> torch.Tensor:
+    """
+    Per-gene relative variance ``var / mean**2`` for the Gamma likelihood,
+    floored at ``min_phi``. This is the phi for which ``Var = mean**2 * phi``,
+    the parameterisation :func:`~pointillhist.train._losses.gamma_cell_loss`
+    expects. Cells with zero total expression are ignored.
+    """
+    expressions = _aggregated_counts(graphs)
+    expressions = expressions[expressions.sum(dim=1) > 0]
+    gene_means = expressions.mean(dim=0)
+    gene_vars = expressions.var(dim=0, unbiased=False)
+    eps = 1e-8
+    phi = gene_vars / (gene_means * gene_means + eps)
+    return phi.clamp_min(min_phi).to(device)
+
+
 def setup_training(
     net: nn.Module,
     graphs: list,
@@ -185,10 +206,12 @@ def setup_training(
         init_disp = estimate_initial_dispersions_normal(graphs, device)
     elif cell_loss_type == 'log-normal':
         init_disp = estimate_initial_dispersions_lognormal(graphs, device)
+    elif cell_loss_type == 'gamma':
+        init_disp = estimate_initial_dispersions_gamma(graphs, device)
     else:
         raise ValueError(
             f"Unknown cell loss type: {cell_loss_type}. Possible values are: "
-            "['zip', 'zinb', 'nb', 'poisson', 'normal', 'log-normal']."
+            "['zip', 'zinb', 'nb', 'poisson', 'normal', 'log-normal', 'gamma']."
         )
     net.dispersion = nn.Parameter(init_disp.to(device))
 
