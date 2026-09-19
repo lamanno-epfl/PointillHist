@@ -3,8 +3,9 @@
 Every setting below has a default that works for typical imaging-based datasets. Start
 from the defaults, look at the loss curves and the assignment, and change one setting at a
 time. The three families follow the three calls that take settings: `generate_graphs`,
-`networks` and `train`; `predict` has nothing to tune (its only option, `top_k`, chooses
-between the sparse top-5 and the dense form of `all_probs`, see the README).
+`networks` and `train`; `predict` has nothing to tune (`top_k` chooses between the sparse
+top-5 and the dense form of `all_probs`, `fields` which outputs are kept, and `out` whether
+they are written to disk, see the README).
 
 ## Graph generation — `ph.pp.generate_graphs`
 
@@ -14,6 +15,8 @@ between the sparse top-5 and the dense form of `all_probs`, see the README).
 | `cell_cell_k_neighbors` | `30` | Neighbours each cell exchanges information with. The default is a safe start even for a 1 000-type atlas (the ABCA-2 example uses it). In practice, due to the long-range message passing between grid hubs, changing it won't change mappings significantly. |
 | `grid_spacing` | `"auto"` | Spacing of the fine grid whose local composition is compared with the reference. `"auto"` is ten times the median nearest-neighbour distance between cells, widened below 50 transcripts per cell so that a grid point still pools enough transcripts. A grid point should cover a few dozen cells; widen the spacing for sparse data, as it helps local consistency of mappings through the gird loss. |
 | `coarse_grid_side` | `7` | The coarse grid has about `side × side` nodes per tile (a hexagonal lattice with `side` columns) and captures the composition of the whole tile. |
+| `save_dir` | none | A folder: the graphs are written there section by section and returned as a `DiskGraphs`, loaded one at a time when needed. Use it when the graphs do not fit in memory (see the README, *Large datasets*). |
+| `n_workers` | `1` | With `save_dir`, the number of sections built at the same time by as many worker processes; each takes about 1 GB and a few seconds to start, plus the section it builds. The graphs, warnings and errors are the same. |
 
 `ph.pp.auto_graph_parameters(sections, genes)` returns the automatic values, so they can
 be inspected, logged and passed back explicitly to rebuild identical graphs later. A
@@ -42,6 +45,8 @@ changing.
 | `batch_size` | `1` | Graphs per optimiser step. 1 for large tiles; 4 for many small sections, as in the atlas example. |
 | `num_epochs` | `100` | 100 is enough for the datasets we ran; the loss curves in `history` show whether fewer would do. |
 | `keep_on_device` | `"auto"` | Where the graphs live while training. `"auto"` measures the memory of a step during the first epoch, then keeps all graphs on the GPU when they fit and otherwise copies each one to the GPU for its step (about 1.5× slower). `True` forces the resident mode, `False` the copying mode. |
+| `prefetch` | `0` | With a `DiskGraphs`, the number of upcoming graphs loaded in a background thread while the GPU trains, which saves the time spent reading files. Training sees the same graphs in the same order (the numbers agree up to floating-point rounding). |
+| `setup_graphs` | `"auto"` | Graphs the initial dispersions and distance scalers are estimated from: all graphs of a list, at most 1000 randomly chosen graphs of a `DiskGraphs` (a fixed draw). `None` uses every graph, an integer that many. Fewer graphs make the setup faster; on 310 tiles of 19 brain sections, 100 random tiles moved the count-model dispersions by about 5 % and the distance scalers by under 2 % (the `zip` loss does not use the dispersions). |
 
 ### Spatial anatomical priors
 

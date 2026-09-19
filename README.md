@@ -29,7 +29,7 @@ of thousands of cell types, separating transcriptionally close subtypes.
 The method is described in
 [**Context-aware cell identity assignment maps the 3D cellular architecture of the human embryonic brain**](PAPER_URL_PLACEHOLDER).
 
-**Contents:** [Installation](#installation) · [Quick start](#quick-start) · [Inputs and outputs](#inputs-and-outputs) · [Examples](#examples) · [Hyperparameters](#hyperparameters) · [GPU usage](#gpu-usage) · [Citation](#citation) · [License](#license)
+**Contents:** [Installation](#installation) · [Quick start](#quick-start) · [Inputs and outputs](#inputs-and-outputs) · [Examples](#examples) · [Hyperparameters](#hyperparameters) · [GPU usage](#gpu-usage) · [Large datasets](#large-datasets) · [Citation](#citation) · [License](#license)
 
 ## Installation
 
@@ -98,6 +98,7 @@ every per-cell and per-grid-node entry is a NumPy array, ready for `pandas` or `
 | [`examples/minimal.py`](examples/minimal.py) | A demonstration of the optional inputs in one run: several sections with a timepoint label each, per-cell region labels with a cell types × regions table for the anatomical prior, and expected proportions per timepoint as the type prior. `python examples/minimal.py --demo` runs it on a small synthetic dataset that the script generates itself, writing to a temporary directory whose path is printed at the end. |
 | [`examples/train_abca2_supertype.py`](examples/train_abca2_supertype.py) | The Zhuang MERFISH atlas of the adult mouse brain (ABCA-2, 66 sections, 1.2 M cells) mapped to the ~1200 supertypes of the Yao 2023 taxonomy, then backtracked to subclasses and classes. |
 | [`examples/p1pup_mapping.ipynb`](examples/p1pup_mapping.ipynb) | A whole Xenium Prime section of a newborn mouse (1.3 M cells, 5000 genes) mapped to 181 cell types of a whole-body reference. |
+| [`examples/train_large.py`](examples/train_large.py) | A template for datasets larger than memory, on one or several GPUs: graphs and predictions kept on disk (see [Large datasets](#large-datasets)). `python examples/train_large.py --demo` runs it on the skin tables. |
 
 ## Hyperparameters
 
@@ -123,6 +124,65 @@ it happens later, after the graphs were moved to the GPU, force the copying mode
 For fully deterministic GPU runs, follow the short
 [reproducibility setup](environments.md#reproducibility). It combines fixed random seeds
 with PyTorch deterministic algorithms, which can make training slower.
+
+## Large datasets
+
+The graphs, and the results of `predict`, are normally held in memory: a few kB per cell for
+the graphs (about 2 kB with 400 genes, 5 kB with 1100, more for molecule tables), and as much
+again while training starts. When that does not fit, keep them on disk. The calls stay the
+same, and so do the results:
+
+```python
+graphs = ph.pp.generate_graphs(sections, reference, save_dir="work/graphs")   # written section by section
+net = ph.tr.networks(graphs)
+net, history = ph.tr.train(net, graphs, reference)
+ph.eval.predict(net, graphs, out="work/predictions")                          # written graph by graph
+result = ph.eval.read_predictions("work/predictions", sections=["section_1.h5ad"])
+```
+
+- `generate_graphs(..., save_dir=)` returns a `ph.pp.DiskGraphs`: a folder with one compact
+  file per graph (about 6 times smaller than in memory, 20 times for molecule tables), from
+  which each function loads the graphs it needs one at a time. `ph.pp.load_graphs(folder)`
+  opens it again later, and `ph.pp.save_graphs(graphs, folder)` writes an existing list.
+  Building the graphs holds one section at a time (its counts and all its tiles), so a
+  section too large for memory on its own has to be split into several files first;
+  `n_workers=` builds that many sections at a time in as many worker processes (each takes
+  about 1 GB and a few seconds to start, plus the section it builds).
+- Training holds one batch of graphs. The dispersions and distance scalers are estimated
+  before training from at most 1000 randomly chosen graphs of a `DiskGraphs`;
+  `setup_graphs=None` uses all of them, still one at a time. `prefetch=` loads that many
+  upcoming graphs in a background thread while the GPU works; training sees the same graphs
+  in the same order.
+- `predict(..., out=)` writes one row per cell to the Parquet dataset `work/predictions/cells`
+  (predicted type, the five largest probabilities, position, cell id, section, timepoint,
+  condition), which `pandas.read_parquet` reads directly; `fields=` adds the logits,
+  embeddings, expression, scales or grid outputs. This needs `pyarrow`:
+  `pip install "pointillhist[parquet]"`.
+- Keep the folder on a local disk, or in `/dev/shm`, rather than on a network file system:
+  training reads from it at every step.
+
+On several GPUs of a node, run the script with `torchrun --nproc_per_node=<n_gpus>` and call
+`ph.tr.train_distributed`, which takes the arguments of `train`. Every process reads the same
+folder, the processes share the setup and the epochs, and `predict(..., out=)`, called by every
+process, writes one part per GPU; process 0 returns once the whole output is written.
+[`examples/train_large.py`](examples/train_large.py) does this.
+
+With graphs on disk a process holds the network, one batch of graphs and the outputs of one
+graph, so host memory stays the same as the dataset grows. Measured on one A100 (80 GB) with
+the 19 EEL sections of the human embryonic brain (437 genes, 435 types, 310 tiles), and with
+10 and 18 copies of them, for the setup, one epoch (`batch_size=2`, `prefetch=2`) and
+`predict(..., out=)`:
+
+| Cells | Graphs | Graphs in memory would take | Peak host memory | Peak GPU memory | Setup + epoch | Predict |
+|---|---|---|---|---|---|---|
+| 5.5 M | list | 21 GB | 53 GB | 37 GB | 104 s | 37 s |
+| 5.5 M | on disk | 21 GB | 3.0 GB | 37 GB | 92 s | 33 s |
+| 55 M | on disk | 214 GB | 3.1 GB | 40 GB | 612 s | 322 s |
+| 99 M | on disk | 385 GB | 3.1 GB | 42 GB | 1038 s | 584 s |
+
+Cells are counted once (tile overlaps aside); the predictions of the 99 M cells take 4.5 GB
+on disk. Building the 19 sections' graphs (3.6 GB on disk) took 256 s in one process with 8
+threads, and 58 s with `n_workers=8` and 8 threads per worker.
 
 ## Citation
 

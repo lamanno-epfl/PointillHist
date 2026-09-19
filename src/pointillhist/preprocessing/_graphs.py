@@ -1,6 +1,14 @@
+import importlib.machinery
 import itertools
 import math
 import os
+import pickle
+import queue
+import signal
+import subprocess
+import sys
+import tempfile
+import threading
 import warnings
 
 import anndata as ad
@@ -12,7 +20,9 @@ from scipy.sparse import issparse
 from sklearn.neighbors import KDTree
 from torch_geometric.nn import SimpleConv
 
+from . import _graph_worker
 from ._reference import load_reference
+from ._store import _GraphWriter
 from ._topology import (
     hex_grid_by_spacing,
     build_tile_graph,
@@ -550,6 +560,8 @@ def generate_graphs(
     counts_min_cell=-1,
     coarse_grid_side=7,
     device="cpu",
+    save_dir=None,
+    n_workers=1,
 ):
     """Tile every spatial section into HeteroData graphs.
 
@@ -582,15 +594,37 @@ def generate_graphs(
         currently has no effect and ``cell_cell_maxdist`` is fixed at 90
         (deliberate, see CLEANUP_PLAN.md §11); on the AnnData path ``min_dots``
         is unused.
+    save_dir : str or None
+        None (default): the graphs are returned as a list held in memory. A
+        folder that does not exist or is empty: the graphs are written there
+        section by section as they are built, so memory holds one section (its
+        counts and all its tiles) at a time, and are returned as a
+        :class:`DiskGraphs`, which loads each graph (on the CPU) when it is
+        accessed. The graphs are the same in both cases. If building fails,
+        what was written is removed again.
+    n_workers : int
+        With ``save_dir``, the number of sections built at the same time, by
+        as many Python worker processes (on the CPU); the graphs, warnings and
+        errors are the same as with 1 (default). Each worker first imports
+        pointillhist (several seconds, about 1 GB of memory), then holds one
+        section at a time, so it pays off when sections take longer than
+        that to build. The threads of this process
+        (``torch.get_num_threads()``) are shared out among the workers.
 
     Returns
     -------
-    list of HeteroData, each carrying section_label, section, timepoint_label,
-    timepoint, condition_label, condition, cell_types, genes, unique_cell_ids
-    (and cell_regions, regions when ``region_key`` is given).
+    list of HeteroData (a DiskGraphs with ``save_dir``), each carrying
+    section_label, section, timepoint_label, timepoint, condition_label,
+    condition, cell_types, genes, unique_cell_ids (and cell_regions, regions
+    when ``region_key`` is given).
     """
     if len(spatial_paths) == 0:
         raise ValueError("spatial_paths is empty")
+    if isinstance(n_workers, (bool, np.bool_)) or not isinstance(n_workers, (int, np.integer)) or n_workers < 1:
+        raise ValueError(f"n_workers must be a positive integer, got {n_workers!r}")
+    if n_workers > 1 and save_dir is None:
+        raise ValueError("n_workers > 1 needs save_dir: sections are built in parallel only when the graphs "
+                         "are written to disk")
     reference = load_reference(reference, reference_key)
     cell_types = list(reference.index)
     n_files = len(spatial_paths)
@@ -614,41 +648,22 @@ def generate_graphs(
     if grid_spacing >= min(tile_sides):
         raise ValueError(f"grid_spacing ({grid_spacing:.3g}) must be smaller than tile_side ({min(tile_sides):.3g})")
 
-    graphs, region_labels = [], []
-    for i, path in enumerate(tqdm.tqdm(spatial_paths, desc="Generating graphs")):
-        if isinstance(path, (tuple, list)):
-            tiles, labels = _graphs_from_tables(
-                path[0], path[1], genes, region_key,
-                tile_side=tile_sides[i], min_cells=min_cells, min_dots=min_dots,
-                cell_cell_k_neighbors=cell_cell_k_neighbors, grid_spacing=grid_spacing,
-                fraction_overlap=overlaps[i], counts_min_cell=counts_min_cell,
-                device=device, coarse_grid_side=coarse_grid_side)
-            section_label = os.path.basename(path[1])
-        else:
-            tiles, labels = _graphs_from_anndata(
-                path, genes, region_key,
-                tile_side=tile_sides[i], min_cells=min_cells,
-                cell_cell_k_neighbors=cell_cell_k_neighbors, cell_cell_maxdist=cell_cell_maxdist,
-                grid_spacing=grid_spacing, fraction_overlap=overlaps[i],
-                counts_min_cell=counts_min_cell, device=device, coarse_grid_side=coarse_grid_side)
-            section_label = os.path.basename(path)
-        if not tiles:
-            warnings.warn(f"{section_label}: no tile passed the filters (min_cells={min_cells})")
-        elif graphs and len(tiles[0].vertexes_fov) != len(graphs[0].vertexes_fov):
-            raise ValueError(f"{section_label} is {len(tiles[0].vertexes_fov) // 2}D but "
-                             f"{graphs[0].section_label} is {len(graphs[0].vertexes_fov) // 2}D: "
-                             "2D and 3D sections cannot be mixed")
-        for graph in tiles:
-            graph.section_label = section_label
-            graph.section = i
-            graph.timepoint_label = timepoint_labels[i]
-            graph.timepoint = int(timepoint_codes[i])
-            graph.condition_label = condition_labels[i]
-            graph.condition = int(condition_codes[i])
-            graph.cell_types = cell_types
-            graph.genes = genes
-        graphs += tiles
-        region_labels += labels
+    settings = dict(genes=genes, region_key=region_key, tile_sides=tile_sides, overlaps=overlaps,
+                    min_cells=min_cells, min_dots=min_dots, cell_cell_k_neighbors=cell_cell_k_neighbors,
+                    cell_cell_maxdist=cell_cell_maxdist, grid_spacing=grid_spacing,
+                    counts_min_cell=counts_min_cell, device=device, coarse_grid_side=coarse_grid_side,
+                    timepoint_labels=timepoint_labels, timepoint_codes=timepoint_codes,
+                    condition_labels=condition_labels, condition_codes=condition_codes, cell_types=cell_types)
+    if save_dir is not None:
+        with _GraphWriter(save_dir) as writer:   # an error removes what was written
+            if n_workers > 1:
+                _build_graphs_parallel(spatial_paths, settings, writer, n_workers)
+            else:
+                _build_graphs(spatial_paths, settings, writer)
+            if region_key is not None and not writer.region_vocabulary:
+                raise ValueError(f"no annotated cells found in column {region_key!r}")
+            return writer.close()
+    graphs, region_labels = _build_graphs(spatial_paths, settings)
 
     if region_key is not None:
         region_labels = [_region_strings(labels) for labels in region_labels]
@@ -660,3 +675,320 @@ def generate_graphs(
             graph.regions = regions
 
     return graphs
+
+
+def _section_settings(settings, i):
+    """The arguments of _section_tiles for section ``i``."""
+    return dict(
+        genes=settings["genes"], region_key=settings["region_key"], tile_side=settings["tile_sides"][i],
+        overlap=settings["overlaps"][i], min_cells=settings["min_cells"], min_dots=settings["min_dots"],
+        cell_cell_k_neighbors=settings["cell_cell_k_neighbors"], cell_cell_maxdist=settings["cell_cell_maxdist"],
+        grid_spacing=settings["grid_spacing"], counts_min_cell=settings["counts_min_cell"],
+        device=settings["device"], coarse_grid_side=settings["coarse_grid_side"],
+        timepoint_label=settings["timepoint_labels"][i], timepoint_code=int(settings["timepoint_codes"][i]),
+        condition_label=settings["condition_labels"][i], condition_code=int(settings["condition_codes"][i]),
+        cell_types=settings["cell_types"],
+    )
+
+
+def _section_tiles(i, path, genes, region_key, tile_side, overlap, min_cells, min_dots, cell_cell_k_neighbors,
+                   cell_cell_maxdist, grid_spacing, counts_min_cell, device, coarse_grid_side, timepoint_label,
+                   timepoint_code, condition_label, condition_code, cell_types):
+    """The graphs of section ``i`` with their section, timepoint and condition attributes, the raw
+    region labels of each graph, and the section label."""
+    if isinstance(path, (tuple, list)):
+        tiles, labels = _graphs_from_tables(
+            path[0], path[1], genes, region_key,
+            tile_side=tile_side, min_cells=min_cells, min_dots=min_dots,
+            cell_cell_k_neighbors=cell_cell_k_neighbors, grid_spacing=grid_spacing,
+            fraction_overlap=overlap, counts_min_cell=counts_min_cell,
+            device=device, coarse_grid_side=coarse_grid_side)
+        section_label = os.path.basename(path[1])
+    else:
+        tiles, labels = _graphs_from_anndata(
+            path, genes, region_key,
+            tile_side=tile_side, min_cells=min_cells,
+            cell_cell_k_neighbors=cell_cell_k_neighbors, cell_cell_maxdist=cell_cell_maxdist,
+            grid_spacing=grid_spacing, fraction_overlap=overlap,
+            counts_min_cell=counts_min_cell, device=device, coarse_grid_side=coarse_grid_side)
+        section_label = os.path.basename(path)
+    for graph in tiles:
+        graph.section_label = section_label
+        graph.section = i
+        graph.timepoint_label = timepoint_label
+        graph.timepoint = timepoint_code
+        graph.condition_label = condition_label
+        graph.condition = condition_code
+        graph.cell_types = cell_types
+        graph.genes = genes
+    return tiles, labels, section_label
+
+
+def _check_dimensions(n_vertexes, section_label, first, min_cells):
+    """2D/3D bookkeeping for a section whose graphs have ``n_vertexes`` vertex coordinates (None: no graph).
+    ``first`` is (n_vertexes, section_label) of the first section with graphs; returns it."""
+    if n_vertexes is None:
+        warnings.warn(f"{section_label}: no tile passed the filters (min_cells={min_cells})")
+    elif first is None:
+        first = (n_vertexes, section_label)
+    elif n_vertexes != first[0]:
+        raise ValueError(f"{section_label} is {n_vertexes // 2}D but "
+                         f"{first[1]} is {first[0] // 2}D: "
+                         "2D and 3D sections cannot be mixed")
+    return first
+
+
+def _build_graphs(spatial_paths, settings, writer=None):
+    """The section loop of generate_graphs: the graphs and raw region labels of every section, or,
+    with a writer, each section's graphs written as soon as they are built (nothing returned)."""
+    graphs, region_labels = [], []
+    first = None   # (len(vertexes_fov), section_label) of the first graph, for the 2D/3D check
+    for i, path in enumerate(tqdm.tqdm(spatial_paths, desc="Generating graphs")):
+        tiles, labels, section_label = _section_tiles(i, path, **_section_settings(settings, i))
+        first = _check_dimensions(len(tiles[0].vertexes_fov) if tiles else None, section_label, first,
+                                  settings["min_cells"])
+        if writer is None:
+            graphs += tiles
+            region_labels += labels
+        else:
+            for j, graph in enumerate(tiles):
+                writer.add(graph, _region_strings(labels[j]) if settings["region_key"] is not None else None)
+            tiles = labels = graph = None   # only one section in memory
+    return graphs, region_labels
+
+
+def _write_section(folder, token, shared, i, path, threads, section):
+    """Build section ``i`` and write its graphs into ``folder`` (run by _graph_worker in its own process)."""
+    if torch.get_num_threads() != threads:   # set through OMP_NUM_THREADS (torch 2.4 briefly starts
+        torch.set_num_threads(threads)       # a thread per core in set_num_threads)
+    tiles, labels, section_label = _section_tiles(i, path, **section)
+    writer = _GraphWriter.attached(folder, token, shared)
+    try:
+        for j, graph in enumerate(tiles):
+            writer.add(graph, _region_strings(labels[j]) if section["region_key"] is not None else None)
+    except BaseException:
+        writer.abort(remove_folders=False)
+        raise
+    return dict(section_label=section_label, n_vertexes=len(tiles[0].vertexes_fov) if tiles else None,
+                rows=writer.rows, region_vocabulary=writer.region_vocabulary, streamed=writer.streamed_regions)
+
+
+class _RemoteTraceback(Exception):
+    """The traceback of an error raised in a worker process (set as the ``__cause__`` of the error)."""
+
+    def __str__(self):
+        return "\n\n" + self.args[0]
+
+
+def _read_replies(stream, worker, replies):
+    """Put every reply a worker process writes into ``replies``, then (worker, None) when it ends, or
+    (worker, exception) when its replies cannot be read."""
+    try:
+        while True:
+            message = _graph_worker.read_message(stream)
+            replies.put((worker, message))
+            if message is None:
+                return
+    except BaseException as error:
+        replies.put((worker, error))
+
+
+def _loaded(pickled):
+    try:
+        return pickle.loads(pickled)
+    except Exception:
+        return None
+
+
+def _reemit(recorded):
+    """Emit the warnings a worker recorded while building a section as if they were raised here (the
+    filters of this process apply). Each section is shown afresh, as when building in this process,
+    where the filter changes made by pandas and scikit-learn reset "once per place" between sections."""
+    registry = {}
+    for w in recorded:
+        message = _loaded(w["message"]) if w["message"] is not None else None
+        if not isinstance(message, Warning):
+            category = _loaded(w["category"]) if w["category"] is not None else None
+            try:
+                message = category(w["text"])
+            except Exception:
+                message = None
+            if not isinstance(message, Warning):
+                message = UserWarning(f"{w['category_name']}: {w['text']}")
+        warnings.warn_explicit(message, type(message), w["filename"], w["lineno"], module=w["module"],
+                               registry=registry)
+
+
+def _signal_name(number):
+    try:
+        return signal.Signals(number).name
+    except ValueError:
+        return "unknown signal"
+
+
+def _worker_error(reply, path, process, log, problem=None):
+    """The exception to raise for a section whose worker failed (``reply``), ended without a reply (None),
+    or sent a reply that cannot be read (``problem``)."""
+    if reply is None:
+        if problem is not None:
+            process.kill()   # its stream is out of step
+        try:
+            code = process.wait(timeout=10)
+        except subprocess.TimeoutExpired:
+            process.kill()
+            code = process.wait()
+        if problem is not None:
+            how = f"sent a reply that cannot be read ({type(problem).__name__}: {problem})"
+        elif code < 0:
+            how = f"was killed by signal {-code} ({_signal_name(-code)}; SIGKILL often means out of memory)"
+        else:
+            how = f"ended with exit code {code}"
+        log.seek(0)
+        output = log.read().decode(errors="replace").strip()
+        return RuntimeError(f"the process building {path} {how}"
+                            + (f"; its last output:\n{output[-4000:]}" if output else ""))
+    error = _loaded(reply["error"]) if reply["error"] is not None else None
+    if not isinstance(error, BaseException):
+        error = RuntimeError(f"building {path} failed: {reply['error_text']}")
+    error.__cause__ = _RemoteTraceback(reply["traceback"])
+    return error
+
+
+def _search_path():
+    """This process's module search path, with relative entries resolved as its import system resolved
+    them, and the folder holding this package first when the path alone would find another copy."""
+    path = []
+    for entry in sys.path:
+        if not isinstance(entry, str):
+            continue   # skipped by the import system too
+        found = getattr(sys.path_importer_cache.get(entry), "path", None)
+        if entry and not os.path.isabs(entry) and isinstance(found, str) and os.path.isabs(found):
+            path.append(found)   # where this process imports from, whatever the current directory
+        else:
+            path.append(os.path.abspath(entry))
+    parts = __name__.split(".")
+    root = os.path.abspath(__file__)
+    for _ in parts:
+        root = os.path.dirname(root)
+    package = sys.modules.get(parts[0])
+    try:
+        spec = importlib.machinery.PathFinder.find_spec(parts[0], path)
+    except Exception:
+        spec = None
+    if spec is None or package is None or spec.origin is None or spec.origin != getattr(package, "__file__", None):
+        path.insert(0, root)
+    return path
+
+
+def _interpreter_flags():
+    """The command-line flags of this interpreter that a worker should share (-E, -s, -X ...)."""
+    flags = getattr(subprocess, "_args_from_interpreter_flags", None)
+    try:
+        return [f for f in flags() if not f.startswith("-W")] if flags else []
+    except Exception:
+        return []
+
+
+def _build_graphs_parallel(spatial_paths, settings, writer, n_workers):
+    """_build_graphs with a writer, run by ``n_workers`` worker processes (_graph_worker) that build one
+    section at a time each. Replies are taken in section order, so warnings, errors and the 2D/3D check
+    come out as with _build_graphs."""
+    if not sys.executable:
+        raise RuntimeError("n_workers > 1 starts Python processes, but sys.executable is not set")
+    spatial_paths = list(spatial_paths)   # by position, as the other per-section settings
+    n_sections = len(spatial_paths)
+    n_workers = min(n_workers, n_sections)
+    shared = {"cell_types": settings["cell_types"], "genes": settings["genes"]}
+    threads = max(1, torch.get_num_threads() // n_workers)   # the CPUs this process uses, shared out
+    setup = pickle.dumps(dict(path=_search_path(), module=__name__.rsplit(".", 1)[0] + "._graph_worker",
+                              parent=os.getpid()))
+    env = dict(os.environ, OMP_NUM_THREADS=str(threads))
+    # warnings raised while importing are not shown (this process showed them); those raised while
+    # building are recorded and emitted here
+    command = [sys.executable, *_interpreter_flags(), "-W", "ignore", "-c", _graph_worker.BOOTSTRAP]
+    writer.owns_all = True   # an error removes every graph file, whichever process wrote it
+    replies = queue.Queue()
+    processes, logs, readers = [], [], []
+    busy, results = {}, {}   # worker -> section it builds; section -> (worker, reply, problem)
+    handed, done, first, stop = 0, 0, None, False
+
+    def send(worker, payload):
+        try:
+            _graph_worker.write_message(processes[worker].stdin, payload)
+        except OSError:   # the worker has ended, which its reader reports
+            pass
+
+    def hand_out(worker):
+        nonlocal handed
+        section = dict(_section_settings(settings, handed), device="cpu")
+        task = pickle.dumps(dict(folder=writer.path, token=writer.token, shared=shared, i=handed,
+                                 path=spatial_paths[handed], threads=threads, section=section))
+        busy[worker] = handed
+        handed += 1
+        send(worker, task)
+
+    bar = tqdm.tqdm(total=n_sections, desc="Generating graphs")
+    try:
+        for worker in range(n_workers):
+            logs.append(tempfile.TemporaryFile())   # its output, shown if it ends unexpectedly
+            processes.append(subprocess.Popen(command, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                                              stderr=logs[-1], env=env))
+            readers.append(threading.Thread(target=_read_replies, daemon=True,
+                                            args=(processes[-1].stdout, worker, replies)))
+            readers[-1].start()
+            send(worker, setup)
+        for worker in range(n_workers):
+            hand_out(worker)
+        while done < n_sections:
+            while done not in results:
+                try:
+                    worker, message = replies.get(timeout=1.0)
+                except queue.Empty:
+                    continue
+                if worker not in busy:   # an idle worker ended
+                    continue
+                reply, problem = None, None
+                if isinstance(message, BaseException):
+                    problem = message
+                elif message is not None:
+                    try:
+                        reply = pickle.loads(message)
+                    except Exception as error:
+                        reply = dict(error=None, error_text=f"its reply cannot be read ({error!r})",
+                                     traceback="", warnings=[])
+                results[busy.pop(worker)] = (worker, reply, problem)
+                stop = stop or reply is None or "result" not in reply
+                if not stop and handed < n_sections:   # after a failure, later sections are not needed
+                    hand_out(worker)
+            worker, reply, problem = results.pop(done)
+            if reply is not None:
+                _reemit(reply["warnings"])
+            if reply is None or "result" not in reply:
+                raise _worker_error(reply, spatial_paths[done], processes[worker], logs[worker], problem)
+            outcome = reply["result"]
+            first = _check_dimensions(outcome["n_vertexes"], outcome["section_label"], first,
+                                      settings["min_cells"])
+            writer.merge(outcome["rows"], outcome["region_vocabulary"], outcome["streamed"], shared)
+            done += 1
+            bar.update(1)
+    finally:
+        bar.close()
+        for process in processes:
+            try:
+                process.stdin.close()   # a worker ends at the end of its input
+            except OSError:
+                pass
+            if done < n_sections and process.poll() is None:
+                process.terminate()
+        for process in processes:
+            try:
+                process.wait(timeout=60)
+            except subprocess.TimeoutExpired:
+                process.kill()
+                process.wait()
+        for process, reader in zip(processes, readers):
+            reader.join(timeout=10)
+            if not reader.is_alive():   # never close a stream a reader is blocked in
+                process.stdout.close()
+        for log in logs:
+            log.close()

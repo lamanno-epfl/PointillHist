@@ -7,14 +7,18 @@ import tqdm
 from torch.nn.utils import clip_grad_norm_
 from torch.utils.data import DataLoader, DistributedSampler
 
+from ..preprocessing._store import DiskGraphs
 from ._losses import total_loss
-from ._setup import setup_training
+from ._setup import _initialize_from_disk, _optimizer, setup_training
 from ._train import (
     LOSS_KEYS,
-    _graph_bytes,
     _lambda_anatomical_schedule,
     _lambda_density_schedule,
+    _prefetcher,
     _reference,
+    _resident_bytes,
+    _setup_subset,
+    _to_device,
     _type_priors,
     _type_regions,
     train,
@@ -64,6 +68,8 @@ def train_distributed(
     checkpoint_dir=None,
     keep_on_device="auto",
     device=None,
+    setup_graphs="auto",
+    prefetch=0,
 ):
     """
     :func:`train` on several processes, one per GPU: ``torchrun --nproc_per_node=<n_gpus> script.py``.
@@ -74,11 +80,18 @@ def train_distributed(
     group is created (nccl on GPU, gloo on CPU); end the script with ``torch.distributed.destroy_process_group()``.
     Without torchrun (no process group, ``WORLD_SIZE`` unset or 1) this is exactly :func:`train`.
 
+    Setup: with a list, process 0 estimates the dispersions and distance scalers alone while the others
+    wait (a very long setup can exceed the NCCL timeout, see ``setup_graphs``). With a DiskGraphs (one
+    folder read by every process) each process reads its share of the setup graphs and the results are
+    combined, so no process waits for the others.
+
     Returns
     -------
     net, history
         On every process; ``history`` averages all the graphs of all the processes. Only rank 0
-        shows progress and writes checkpoints; run ``ph.eval.predict`` on rank 0.
+        shows progress and writes checkpoints. Afterwards, run ``ph.eval.predict`` on rank 0 to
+        get the results in memory, or ``ph.eval.predict(..., out=...)`` on every process to
+        write them to disk, each process predicting its share of the graphs.
     """
     if not (dist.is_available() and dist.is_initialized()) and int(os.environ.get("WORLD_SIZE", 1)) <= 1:
         return train(**locals())
@@ -86,6 +99,7 @@ def train_distributed(
     if device is None:
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     device = torch.device(device)
+    _prefetcher(graphs, None, True, prefetch)   # checks the value
     if device.type == "cuda":
         if device.index is None:   # modulo: a launcher may show each process only its own GPU
             local_rank = int(os.environ.get("LOCAL_RANK", torch.cuda.current_device()))
@@ -106,12 +120,18 @@ def train_distributed(
     net.eval()
     if main:
         print(f"Initializing (dispersions, distance scalers, optimizer) for {world_size} processes...")
-    # only rank 0 estimates from every graph; all ranks then start from its parameters and buffers
-    optimizer, scheduler = setup_training(
-        net, graphs if main else graphs[:1], device=device,
-        lr=lr, weight_decay=weight_decay, T_0=T_0, eta_min=eta_min,
-        cell_loss_type=cell_loss_type,
-    )
+    setup_set = _setup_subset(graphs, setup_graphs)
+    if isinstance(graphs, DiskGraphs):
+        # every rank reads its share of the setup graphs; the shares are combined
+        _initialize_from_disk(net, setup_set, device, cell_loss_type, distributed=True)
+        optimizer, scheduler = _optimizer(net, lr, weight_decay, T_0, eta_min)
+    else:
+        # only rank 0 estimates from the setup graphs; all ranks then start from its parameters and buffers
+        optimizer, scheduler = setup_training(
+            net, setup_set if main else graphs[:1], device=device,
+            lr=lr, weight_decay=weight_decay, T_0=T_0, eta_min=eta_min,
+            cell_loss_type=cell_loss_type,
+        )
     net.temperature.fill_(temperature)
     for tensor in [*net.parameters(), *net.buffers()]:
         dist.broadcast(tensor.data, src=0)
@@ -145,8 +165,7 @@ def train_distributed(
     else:
         keep = bool(keep_on_device)
         if keep:
-            for graph in graphs:
-                graph.to(device)
+            graphs = _to_device(graphs, device)
 
     bar = tqdm.tqdm(total=num_epochs * len(data_loader), desc="Training", disable=not main)
 
@@ -160,12 +179,14 @@ def train_distributed(
         lambda_density_eff = _lambda_density_schedule(
             epoch, num_epochs, lambda_density, lambda_density_min, lambda_density_warmup, lambda_density_decay)
 
-        for batch_indices in data_loader:
+        loader = _prefetcher(graphs, data_loader, keep, prefetch)
+        for batch_indices in data_loader if loader is None else loader.epoch():
             optimizer.zero_grad()
             batch_loss = 0.0
 
             for i in batch_indices:
-                graph = graphs[i] if keep else copy.copy(graphs[i]).to(device)
+                source = graphs[i] if loader is None else loader.get(i)
+                graph = source if keep else copy.copy(source).to(device)
 
                 cell_dots, logits, *_, scale, (pi_cell, pi_lowrank) = net(graph)
 
@@ -200,7 +221,7 @@ def train_distributed(
                 for k, val in zip(LOSS_KEYS, losses):
                     epoch_sums[k] += val.detach().cpu().item()
 
-                del pi_cell, pi_lowrank, cell_dots, logits, scale, graph, losses
+                del pi_cell, pi_lowrank, cell_dots, logits, scale, graph, losses, source
 
             avg_batch_loss = batch_loss / len(batch_indices)
             avg_batch_loss.backward()
@@ -228,12 +249,15 @@ def train_distributed(
 
         if keep is None:      # "auto": the first epoch measured the working set of a step (one graph included)
             peak = torch.cuda.max_memory_allocated(device)
-            resident = sum(_graph_bytes(g) for g in graphs)
+            resident = _resident_bytes(graphs)
             capacity = torch.cuda.mem_get_info(device)[1]
             keep = resident + peak <= 0.95 * capacity
+            if isinstance(graphs, DiskGraphs):   # all ranks keep the graphs or none: they load them together
+                decision = torch.tensor([int(keep)], device=device)
+                dist.all_reduce(decision, op=dist.ReduceOp.MIN)
+                keep = bool(decision.item())
             if keep:
-                for graph in graphs:
-                    graph.to(device)
+                graphs = _to_device(graphs, device)
                 if main:
                     bar.write(f"graphs kept on {device}: {resident / 1e9:.1f} GB of graphs + {peak / 1e9:.1f} GB peak "
                               f"per step fit in 95 % of {capacity / 1e9:.0f} GB")

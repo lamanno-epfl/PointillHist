@@ -6,6 +6,8 @@ import matplotlib.pyplot as plt
 import numpy as np
 import seaborn as sns
 
+from ..preprocessing._store import DiskGraphs
+
 __all__ = [
     "fovs",
     "visualize_interaction_metrics",
@@ -20,13 +22,18 @@ def fovs(graphs, downsample_rate=0.1, figscale=10):
     Plot the tiling of every section into tiles (one panel per section).
 
     Parameters:
-        graphs: List of HeteroData graphs as returned by generate_graphs.
+        graphs: List of HeteroData graphs as returned by generate_graphs, or a DiskGraphs
+            (loaded one graph at a time).
         downsample_rate: Fraction of the core cells of each tile to draw.
         figscale: Figure width in inches (the height follows the panel grid).
     """
     section_tiles = defaultdict(list)
-    for graph in graphs:
-        section_tiles[graph.section_label].append(graph)
+    if isinstance(graphs, DiskGraphs):   # positions, grouped from the index; each graph is loaded when drawn
+        for position, label in enumerate(graphs._column("section_label")):
+            section_tiles[label].append(position)
+    else:
+        for graph in graphs:
+            section_tiles[graph.section_label].append(graph)
 
     c = int(np.sqrt(len(section_tiles)))
     r = int(np.ceil(len(section_tiles) / c))
@@ -35,7 +42,8 @@ def fovs(graphs, downsample_rate=0.1, figscale=10):
     for n, tiles in enumerate(section_tiles.values()):
         ax = plt.subplot(gs[n])
         counter_cells = 0
-        for graph in tiles:
+        for tile in tiles:
+            graph = graphs[tile] if isinstance(graphs, DiskGraphs) else tile
             cells = graph["cells"].pos.cpu().numpy()
             cells_bool = graph["cells"].is_core.cpu().numpy()
             gridpoints = graph["longrange_grid"].pos.cpu().numpy()

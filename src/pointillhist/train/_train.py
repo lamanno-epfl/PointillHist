@@ -1,5 +1,7 @@
 import copy
 import os
+import queue
+import threading
 
 import numpy as np
 import pandas as pd
@@ -9,10 +11,14 @@ from torch.nn.utils import clip_grad_norm_
 from torch.utils.data import DataLoader
 
 from ..preprocessing._reference import load_reference
+from ..preprocessing._store import DiskGraphs, _graph_values
 from ._setup import setup_training
 from ._losses import total_loss
 
 __all__ = ["train"]
+
+#: ``setup_graphs="auto"`` estimates the setup from at most this many graphs of a DiskGraphs.
+SETUP_GRAPHS_DISK = 1000
 
 #: Order must match the tuple returned by :func:`total_loss`.
 LOSS_KEYS = [
@@ -85,12 +91,156 @@ def _graph_bytes(graph):
     return sum(v.numel() * v.element_size() for store in graph.stores for v in store.values() if torch.is_tensor(v))
 
 
+def _resident_bytes(graphs):
+    """Device memory the graphs take when all of them are kept there."""
+    if isinstance(graphs, DiskGraphs):
+        return graphs.nbytes
+    return sum(_graph_bytes(g) for g in graphs)
+
+
+def _to_device(graphs, device):
+    """The graphs kept on ``device``: a list is moved in place, a DiskGraphs is loaded graph by graph
+    (without the per-cell ids, which training does not use and which would stay in host memory)."""
+    if isinstance(graphs, DiskGraphs):
+        kept = []
+        for graph in graphs:
+            graph._global_store.pop("unique_cell_ids", None)
+            kept.append(graph.to(device))
+        return kept
+    for graph in graphs:
+        graph.to(device)
+    return graphs
+
+
+def _first(graphs, name, *default):
+    """An attribute of the first graph; a DiskGraphs reads cell_types, genes and regions from its index."""
+    if isinstance(graphs, DiskGraphs) and name in ("cell_types", "genes", "regions"):
+        return getattr(graphs, name)
+    return getattr(graphs[0], name, *default)
+
+
+def _setup_subset(graphs, setup_graphs):
+    """The graphs the setup estimates from: all of them, or ``k`` drawn with a fixed seed (the
+    same on every process; the global random state is not used)."""
+    n = len(graphs)
+    if isinstance(setup_graphs, str) and setup_graphs == "auto":
+        k = min(n, SETUP_GRAPHS_DISK) if isinstance(graphs, DiskGraphs) else n
+    elif setup_graphs is None:
+        k = n
+    elif isinstance(setup_graphs, (int, np.integer)) and not isinstance(setup_graphs, (bool, np.bool_)) \
+            and setup_graphs >= 1:
+        k = min(n, int(setup_graphs))
+    else:
+        raise ValueError(f'setup_graphs must be "auto", None or a positive integer, got {setup_graphs!r}')
+    if k == n:
+        return graphs
+    chosen = np.sort(np.random.default_rng(0).choice(n, size=k, replace=False))
+    if isinstance(graphs, DiskGraphs):
+        return graphs.subset(chosen)
+    return [graphs[i] for i in chosen]
+
+
+class _Prefetcher:
+    """Loads one epoch's graphs of a DiskGraphs in a background thread, up to ``depth`` graphs ahead.
+
+    The batches are listed up front, which draws the shuffle exactly as iterating the loader does,
+    so training sees the same graphs in the same order with and without it.
+    """
+
+    def __init__(self, graphs, data_loader, depth):
+        self.batches = list(data_loader)
+        order = [int(i) for batch in self.batches for i in batch]
+        self._state = {"stop": threading.Event(), "done": threading.Event(), "queue": queue.Queue(maxsize=depth)}
+        self._thread = threading.Thread(target=_prefetch, args=(graphs, order, self._state), daemon=True)
+        self._thread.start()
+
+    def get(self, i):
+        position, item = self._state["queue"].get()
+        if position is None:   # the loading thread failed
+            raise item
+        if position != int(i):
+            raise RuntimeError(f"graph {position} was loaded where graph {int(i)} was expected")
+        return item
+
+    def epoch(self):
+        """The batches of the epoch; the loading thread is stopped when the loop over them ends,
+        normally or through an exception (the loop releases this generator as it unwinds)."""
+        try:
+            yield from self.batches
+        except GeneratorExit:   # the loop was left early; its exception is on its way
+            self.close(reraise=False)
+            raise
+        self.close()
+
+    def close(self, reraise=True):
+        """Stop the loading thread and wait until it has ended (at most one graph load). A Ctrl-C meanwhile
+        does not cut the wait short; it is raised afterwards (with ``reraise``)."""
+        self._state["stop"].set()
+        interrupted = False
+        while True:
+            try:
+                self._drain()   # wakes the thread if it waits to put a graph
+                if self._state["done"].wait(0.1):
+                    break
+            except KeyboardInterrupt:
+                interrupted = True
+        self._drain()   # a graph it put meanwhile
+        if interrupted and reraise:
+            raise KeyboardInterrupt
+
+    def _drain(self):
+        while True:
+            try:
+                self._state["queue"].get_nowait()
+            except queue.Empty:
+                return
+
+    def __del__(self):   # an exception left the epoch: stop the thread
+        state = getattr(self, "_state", None)
+        if state is not None:
+            state["stop"].set()
+
+
+def _prefetch(graphs, order, state):
+    items, stop = state["queue"], state["stop"]
+    try:
+        for i in order:
+            graph = graphs[i]
+            while not stop.is_set():
+                try:
+                    items.put((i, graph), timeout=0.1)
+                    break
+                except queue.Full:
+                    pass
+            graph = None   # an error loading the next graph must not keep this one alive
+            if stop.is_set():
+                return
+    except BaseException as error:   # handed to the training loop
+        while not stop.is_set():
+            try:
+                items.put((None, error), timeout=0.1)
+                return
+            except queue.Full:
+                pass
+    finally:
+        state["done"].set()
+
+
+def _prefetcher(graphs, data_loader, keep, prefetch):
+    """A _Prefetcher when ``prefetch`` asks for one and the graphs are read from disk for each step."""
+    if isinstance(prefetch, (bool, np.bool_)) or not isinstance(prefetch, (int, np.integer)) or prefetch < 0:
+        raise ValueError(f"prefetch must be a non-negative integer, got {prefetch!r}")
+    if prefetch and not keep and isinstance(graphs, DiskGraphs):
+        return _Prefetcher(graphs, data_loader, int(prefetch))
+    return None
+
+
 def _reference(reference, graphs):
     """(K, G) float tensor aligned to the graphs' cell types and genes."""
     if isinstance(reference, (torch.Tensor, np.ndarray)):
         return torch.as_tensor(reference, dtype=torch.float32)
     table = load_reference(reference)
-    return torch.tensor(table.loc[graphs[0].cell_types, graphs[0].genes].values, dtype=torch.float32)
+    return torch.tensor(table.loc[_first(graphs, "cell_types"), _first(graphs, "genes")].values, dtype=torch.float32)
 
 
 def _type_priors(type_priors, graphs):
@@ -100,9 +250,9 @@ def _type_priors(type_priors, graphs):
             'type_priors must be "uniform", a DataFrame/csv path (cell types x timepoint '
             "labels) or a (K,) array/Series/tensor, not None"
         )
-    cell_types = list(graphs[0].cell_types)
+    cell_types = list(_first(graphs, "cell_types"))
     K = len(cell_types)
-    labels = {g.timepoint: g.timepoint_label for g in graphs}
+    labels = dict(zip(_graph_values(graphs, "timepoint"), _graph_values(graphs, "timepoint_label")))
     n_timepoints = max(labels) + 1
 
     if isinstance(type_priors, str) and type_priors == "uniform":
@@ -147,16 +297,17 @@ def _type_regions(type_regions, graphs):
     """(K, n_regions) float tensor aligned to the graphs' cell types and regions, or None."""
     if type_regions is None:
         return None
-    regions = getattr(graphs[0], "regions", None)
+    regions = _first(graphs, "regions", None)
     if regions is None:
         raise ValueError("graphs carry no cell regions; pass region_key= to generate_graphs")
     if isinstance(type_regions, str):
         type_regions = pd.read_csv(type_regions, index_col=0)
+    cell_types = _first(graphs, "cell_types")
     if isinstance(type_regions, pd.DataFrame):
         # cell_types and regions are str, so cast the table's labels too
-        type_regions = type_regions.rename(index=str, columns=str).loc[list(graphs[0].cell_types), regions].values
+        type_regions = type_regions.rename(index=str, columns=str).loc[list(cell_types), regions].values
     type_regions = torch.as_tensor(type_regions, dtype=torch.float32)
-    expected = (len(graphs[0].cell_types), len(regions))
+    expected = (len(cell_types), len(regions))
     if tuple(type_regions.shape) != expected:
         raise ValueError(
             f"type_regions must have shape (n_cell_types, n_regions) = {expected}, "
@@ -194,14 +345,18 @@ def train(
     checkpoint_dir=None,
     keep_on_device="auto",
     device=None,
+    setup_graphs="auto",
+    prefetch=0,
 ):
     """
     Train the network, reporting a running average of each loss term per epoch.
 
     Parameters
     ----------
-    graphs : list of HeteroData
+    graphs : list of HeteroData or DiskGraphs
         Output of ``generate_graphs``; sizes, timepoints and regions are read from it.
+        A DiskGraphs (``generate_graphs(..., save_dir=...)``) is read one graph at a
+        time, so host memory does not grow with the number of graphs.
     reference : DataFrame | csv path | (K, G) tensor/array
         Cell types x genes expression profiles, aligned by name to the graphs.
     type_priors : "uniform" | DataFrame/csv (cell types x timepoint labels) | (K,) array/Series/tensor
@@ -227,7 +382,23 @@ def train(
         copying mode while the peak memory of a step is measured; from the
         second epoch on the graphs stay resident if all of them plus that peak
         fit in 95 % of the device memory, otherwise a note is printed and the
-        copying mode continues. Irrelevant on a CPU device.
+        copying mode continues. Irrelevant on a CPU device. With a DiskGraphs the
+        graphs are loaded from disk for each step in the copying mode, and loaded
+        onto the device one by one when they are kept there.
+    setup_graphs : "auto" | None | int
+        Graphs the dispersions and distance scalers are estimated from before
+        training. None: all of them. An integer k: k graphs drawn with a fixed
+        seed (all of them if there are fewer), a faster approximation for large
+        datasets. "auto" (default): all graphs of a list, at most 1000 of a
+        DiskGraphs.
+    prefetch : int
+        With a DiskGraphs read from disk for each step, load this many upcoming
+        graphs in a background thread while the device works on the current
+        ones (0, the default: load each graph when its step starts). Training
+        sees the same graphs in the same order, so the results agree up to
+        floating-point rounding (the thread changes where memory is allocated,
+        which can move the last bits); host memory holds up to ``prefetch + 2``
+        graphs.
 
     Returns
     -------
@@ -236,6 +407,7 @@ def train(
     if device is None:
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     device = torch.device(device)
+    _prefetcher(graphs, None, True, prefetch)   # checks the value
 
     reference = _reference(reference, graphs).to(device)
     priors = _type_priors(type_priors, graphs)
@@ -247,7 +419,7 @@ def train(
     net.eval()
     print("Initializing (dispersions, distance scalers, optimizer)...")
     optimizer, scheduler = setup_training(
-        net, graphs, device=device,
+        net, _setup_subset(graphs, setup_graphs), device=device,
         lr=lr, weight_decay=weight_decay, T_0=T_0, eta_min=eta_min,
         cell_loss_type=cell_loss_type,
     )
@@ -279,8 +451,7 @@ def train(
     else:
         keep = bool(keep_on_device)
         if keep:
-            for graph in graphs:
-                graph.to(device)
+            graphs = _to_device(graphs, device)
 
     bar = tqdm.tqdm(total=num_epochs * len(data_loader), desc="Training")
 
@@ -293,7 +464,8 @@ def train(
         lambda_density_eff = _lambda_density_schedule(
             epoch, num_epochs, lambda_density, lambda_density_min, lambda_density_warmup, lambda_density_decay)
 
-        for batch_indices in data_loader:
+        loader = _prefetcher(graphs, data_loader, keep, prefetch)
+        for batch_indices in data_loader if loader is None else loader.epoch():
             optimizer.zero_grad()
             batch_loss = 0.0
 
@@ -301,7 +473,8 @@ def train(
                 # a resident graph is used in place; otherwise a shallow copy carries this step's tensors to the
                 # device while the host copy stays untouched (nothing is copied back, the device copy is freed
                 # once the step's autograd graph is released)
-                graph = graphs[i] if keep else copy.copy(graphs[i]).to(device)
+                source = graphs[i] if loader is None else loader.get(i)
+                graph = source if keep else copy.copy(source).to(device)
 
                 cell_dots, logits, *_, scale, (pi_cell, pi_lowrank) = net(graph)
 
@@ -336,7 +509,7 @@ def train(
                 for k, val in zip(LOSS_KEYS, losses):
                     epoch_sums[k] += val.detach().cpu().item()
 
-                del pi_cell, pi_lowrank, cell_dots, logits, scale, graph, losses
+                del pi_cell, pi_lowrank, cell_dots, logits, scale, graph, losses, source
 
             if len(batch_indices) > 0:
                 avg_batch_loss = batch_loss / len(batch_indices)
@@ -366,12 +539,11 @@ def train(
         if keep is None:      # "auto": the first epoch measured the working set of a step (one graph included)
             index = torch.cuda.current_device() if device.index is None else device.index
             peak = torch.cuda.max_memory_allocated(index)
-            resident = sum(_graph_bytes(g) for g in graphs)
+            resident = _resident_bytes(graphs)
             capacity = torch.cuda.mem_get_info(index)[1]
             keep = resident + peak <= 0.95 * capacity
             if keep:
-                for graph in graphs:
-                    graph.to(device)
+                graphs = _to_device(graphs, device)
                 bar.write(f"graphs kept on {device}: {resident / 1e9:.1f} GB of graphs + {peak / 1e9:.1f} GB peak per step "
                           f"fit in 95 % of {capacity / 1e9:.0f} GB")
             else:

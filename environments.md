@@ -23,6 +23,7 @@ releases, and the two columns below are the two environments we use.
 | umap-learn (extra `umap`, for `ph.eval.umap`) | >= 0.5 | 0.5.7 | 0.5.9 |
 | openpyxl (extra `examples`, for the ABCA-2 example) | >= 3.1 | 3.1.5 | 3.1.5 |
 | ipykernel (extra `examples`, to run the example notebooks) | >= 6 | 6.29.5 | 6.29.5 |
+| pyarrow (extra `parquet`, for `ph.eval.predict(..., out=...)`) | >= 16 | not used | 20.0.0 |
 
 `pandas` stays below 3.0 for now: pandas 3 changes the default string dtype, and the
 molecule-table (`dots.csv`, `cells.csv`) path of `generate_graphs` fails on it; the AnnData
@@ -75,7 +76,7 @@ install into a plain virtual environment (`--torch-backend=auto` picks the CUDA 
 the installed driver, `cpu` the CPU build):
 
 ```bash
-uv venv && uv pip install --torch-backend=cpu -e ".[umap,examples]"
+uv venv && uv pip install --torch-backend=cpu -e ".[umap,parquet,examples]"
 ```
 
 or, after `uv sync`, swap the locked `torch` inside the project with
