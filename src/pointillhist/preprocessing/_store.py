@@ -87,9 +87,10 @@ def _equal(a, b):
 
 
 def _frequency(value):
-    """The step of a date or period index, as (name, string) so that None and an absent freq differ."""
+    """The step of a date or period index, as (name, offset) so that None and an absent freq differ.
+    The offset itself, not its text: str() of a custom-calendar offset drops its holidays and weekmask."""
     freq = getattr(value, "freq", None)
-    return None if freq is None else (type(freq).__name__, str(freq))
+    return None if freq is None else (type(freq).__name__, freq)
 
 
 def _bits(t):
